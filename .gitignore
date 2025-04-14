@@ -1,0 +1,8 @@
+/.env
+
+*.log
+*.pyc
+*.csv
+*.png
+*.html
+*.json

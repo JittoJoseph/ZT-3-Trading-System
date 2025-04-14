@@ -19,6 +19,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
+# Import for loading environment variables
+from dotenv import load_dotenv
+
 # Add project root to Python path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -26,6 +29,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from backtest.backtester import Backtester
 from config.loader import ConfigLoader
 from utils.logger import setup_logging
+from utils.notifications import NotificationManager
+
+# Load environment variables from .env file
+load_dotenv()
 
 def parse_arguments():
     """
@@ -187,6 +194,39 @@ def main():
         
         print(f"\nBacktest results saved to: {output_dir}")
         print(f"Report: {results['report']}")
+        
+        # Send results to Discord if webhook is configured
+        try:
+            # Setup notifications with environment variables
+            notifications_config = {
+                'notifications': {
+                    'discord': {
+                        'enabled': True,
+                        'webhooks': {
+                            'backtest_results': os.environ.get('DISCORD_WEBHOOK_BACKTEST')
+                        }
+                    },
+                    'notification_levels': {
+                        'backtest_results': True
+                    }
+                }
+            }
+            
+            # Initialize NotificationManager with config
+            notifier = NotificationManager(notifications_config)
+            
+            # Add strategy name and symbol to metrics for the notification
+            metrics['strategy_name'] = config.get('strategy', {}).get('name', 'ZT-3 Strategy')
+            metrics['symbol'] = ', '.join(backtester.symbols)
+            
+            # Send notification
+            if notifier.send_backtest_results(metrics):
+                logger.info("Backtest results sent to Discord successfully")
+                print("Backtest results sent to Discord webhook")
+            else:
+                logger.warning("Failed to send backtest results to Discord")
+        except Exception as e:
+            logger.warning(f"Error sending Discord notification: {e}")
         
         return 0
     
