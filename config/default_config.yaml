@@ -14,15 +14,9 @@ symbols:
     min_qty: 1
     tick_size: 0.05
     lot_size: 1
-  - ticker: "SBIN"
+  - ticker: "CANBK"
     exchange: "NSE"
-    name: "State Bank of India"
-    min_qty: 1
-    tick_size: 0.05
-    lot_size: 1
-  - ticker: "BANKBARODA"
-    exchange: "NSE"
-    name: "Bank of Baroda"
+    name: "Canara Bank"
     min_qty: 1
     tick_size: 0.05
     lot_size: 1
