@@ -539,5 +539,3 @@ class PaperTrader:
             } if worst_trade else {},
             "date": datetime.now().strftime("%Y-%m-%d")
         }
-```
-</copilot-edited-file>

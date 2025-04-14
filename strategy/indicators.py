@@ -1,461 +1,258 @@
 """
 Technical Indicators Module for ZT-3 Trading System.
 
-This module provides implementations of technical indicators used
-for the Gaussian Channel strategy and other technical analysis.
+This module provides implementations of various technical indicators
+used by the trading strategies, including the Gaussian Channel indicator.
 """
 
 import logging
-import numpy as np
 import pandas as pd
-from typing import Dict, List, Any, Optional, Union, Tuple
+import numpy as np
+from typing import Dict, List, Any, Union, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 class Indicators:
     """
-    Technical indicators for the ZT-3 Trading System.
+    Technical indicators for trading strategies.
     
-    Provides implementations of indicators used in the Gaussian Channel strategy
-    and other technical analysis methods.
+    This class implements various technical indicators used by trading strategies,
+    particularly focused on implementing the Gaussian Channel strategy indicators.
     """
     
     @staticmethod
-    def gaussian_channel(df: pd.DataFrame,
-                        source_col: str = 'hlc3',
-                        period: int = 144,
-                        multiplier: float = 1.2,
-                        poles: int = 4,
-                        reduced_lag: bool = False,
-                        fast_response: bool = False) -> pd.DataFrame:
+    def gaussian_channel(df: pd.DataFrame, source_col: str = 'close', period: int = 144, 
+                        multiplier: float = 1.2, std_dev_period: int = 144) -> pd.DataFrame:
         """
         Calculate the Gaussian Channel indicator.
         
         Args:
             df: DataFrame with price data
-            source_col: Source column to use for calculations ('hlc3', 'close', etc.)
-            period: Gaussian Channel sampling period
-            multiplier: True range multiplier for bands
-            poles: Number of poles (1-9)
-            reduced_lag: Use reduced lag mode
-            fast_response: Use fast response mode
+            source_col: Column name to use as source data (default: 'close')
+            period: Period for the Gaussian filter
+            multiplier: Multiplier for the bands
+            std_dev_period: Period for the standard deviation calculation
             
         Returns:
-            DataFrame with Gaussian Channel indicators added
+            DataFrame with added columns: gc_filter, gc_upper, gc_lower
         """
-        # Create a copy of the dataframe to avoid modifying the original
+        if len(df) < period:
+            logger.warning(f"Not enough data for Gaussian Channel calculation. Need at least {period} data points.")
+            return df.copy()
+            
+        # Create a copy of the input DataFrame to avoid modifying it
         result = df.copy()
         
-        # Ensure source column exists
-        if source_col not in result.columns:
-            if source_col == 'hlc3' and all(col in result.columns for col in ['high', 'low', 'close']):
-                # Create HLC3 column if it doesn't exist
-                result[source_col] = (result['high'] + result['low'] + result['close']) / 3
-            else:
-                logger.error(f"Source column '{source_col}' not found in dataframe")
-                return result
+        # Calculate Gaussian filter
+        # This is a simplified implementation using a weighted moving average with normal distribution weights
+        x = np.arange(-3, 3, 6/period)
+        weights = np.exp(-(x**2)/2) / (np.sqrt(2*np.pi))
+        weights = weights / np.sum(weights)  # Normalize weights
         
-        # Calculate Gaussian Channel parameters
-        beta = (1 - np.cos(4 * np.pi / period)) / ((np.power(1.414, 2 / poles)) - 1)
-        alpha = -beta + np.sqrt(beta * beta + 2 * beta)
-        lag = (period - 1) / (2 * poles)
+        # Apply Gaussian filter to source data
+        source_data = result[source_col].values
         
-        # Prepare source data
-        srcdata = result[source_col].values
-        if reduced_lag:
-            # Create lagged version for reduced lag mode
-            srcdata_lag = np.roll(srcdata, int(lag))
-            srcdata_lag[:int(lag)] = srcdata[:int(lag)]  # Avoid lookforward bias
-            srcdata = srcdata + (srcdata - srcdata_lag)
+        # Use convolution for smoothing
+        filter_line = np.convolve(source_data, weights, 'valid')
         
-        # Calculate true range for bands
-        high_vals = result['high'].values
-        low_vals = result['low'].values
-        close_vals = result['close'].values
-        prev_close = np.roll(close_vals, 1)
-        prev_close[0] = close_vals[0]  # Avoid lookforward bias
+        # Pad the beginning to match the original length
+        padding_length = len(source_data) - len(filter_line)
+        filter_line = np.append(np.full(padding_length, np.nan), filter_line)
         
-        tr = np.maximum(high_vals - low_vals, 
-                        np.maximum(np.abs(high_vals - prev_close), 
-                                   np.abs(low_vals - prev_close)))
+        result['gc_filter'] = filter_line
         
-        if reduced_lag:
-            # Create lagged version for reduced lag mode
-            tr_lag = np.roll(tr, int(lag))
-            tr_lag[:int(lag)] = tr[:int(lag)]  # Avoid lookforward bias
-            trdata = tr + (tr - tr_lag)
-        else:
-            trdata = tr
+        # Calculate standard deviation over specified period
+        result['rolling_std'] = result[source_col].rolling(window=std_dev_period).std()
         
-        # Implement the filter calculations
-        filtn = Indicators._gaussian_filter(srcdata, alpha, poles)
-        filt1 = Indicators._gaussian_filter(srcdata, alpha, 1)
+        # Calculate upper and lower bands
+        result['gc_upper'] = result['gc_filter'] + (result['rolling_std'] * multiplier)
+        result['gc_lower'] = result['gc_filter'] - (result['rolling_std'] * multiplier)
         
-        filtntr = Indicators._gaussian_filter(trdata, alpha, poles)
-        filt1tr = Indicators._gaussian_filter(trdata, alpha, 1)
-        
-        # Apply fast response mode if requested
-        if fast_response:
-            filt = (filtn + filt1) / 2
-            filttr = (filtntr + filt1tr) / 2
-        else:
-            filt = filtn
-            filttr = filtntr
-        
-        # Calculate bands
-        hband = filt + filttr * multiplier
-        lband = filt - filttr * multiplier
-        
-        # Add calculated values to the result dataframe
-        result['gc_filter'] = filt
-        result['gc_upper'] = hband
-        result['gc_lower'] = lband
+        # Drop the temporary column
+        result.drop(columns=['rolling_std'], inplace=True)
         
         return result
-    
+        
     @staticmethod
-    def _gaussian_filter(data: np.ndarray, alpha: float, poles: int) -> np.ndarray:
-        """
-        Internal method to calculate the Gaussian filter.
-        
-        Args:
-            data: Input data array
-            alpha: Alpha parameter
-            poles: Number of poles (1-9)
-            
-        Returns:
-            Filtered data
-        """
-        if poles < 1 or poles > 9:
-            logger.warning("Poles must be between 1 and 9. Using 4 as default.")
-            poles = 4
-        
-        result = np.zeros_like(data, dtype=float)
-        
-        if poles == 1:
-            # Single pole implementation (simpler case)
-            a = alpha
-            b = 1 - a
-            prev_val = data[0]
-            
-            for i in range(len(data)):
-                curr_val = a * data[i] + b * prev_val
-                result[i] = curr_val
-                prev_val = curr_val
-                
-            return result
-        
-        # Multi-pole implementation
-        filtered = []
-        
-        # First calculate each pole's filtered series
-        for pole in range(1, poles + 1):
-            pole_result = Indicators._filter_pole(data, alpha, pole)
-            filtered.append(pole_result)
-        
-        # Use the requested number of poles
-        return filtered[poles - 1]
-    
-    @staticmethod
-    def _filter_pole(data: np.ndarray, alpha: float, pole: int) -> np.ndarray:
-        """
-        Calculate a single pole of the Gaussian filter.
-        
-        Args:
-            data: Input data array
-            alpha: Alpha parameter
-            pole: Pole number (1-9)
-            
-        Returns:
-            Filtered data for this pole
-        """
-        # Initialize coefficients based on pole number
-        coef = {}
-        
-        # m2 to m9 coefficients based on pole number
-        if pole >= 2:
-            coef['m2'] = 36 if pole == 9 else \
-                        28 if pole == 8 else \
-                        21 if pole == 7 else \
-                        15 if pole == 6 else \
-                        10 if pole == 5 else \
-                         6 if pole == 4 else \
-                         3 if pole == 3 else \
-                         1 if pole == 2 else 0
-        
-        if pole >= 3:
-            coef['m3'] = 84 if pole == 9 else \
-                        56 if pole == 8 else \
-                        35 if pole == 7 else \
-                        20 if pole == 6 else \
-                        10 if pole == 5 else \
-                         4 if pole == 4 else \
-                         1 if pole == 3 else 0
-        
-        if pole >= 4:
-            coef['m4'] = 126 if pole == 9 else \
-                         70 if pole == 8 else \
-                         35 if pole == 7 else \
-                         15 if pole == 6 else \
-                          5 if pole == 5 else \
-                          1 if pole == 4 else 0
-        
-        if pole >= 5:
-            coef['m5'] = 126 if pole == 9 else \
-                         56 if pole == 8 else \
-                         21 if pole == 7 else \
-                          6 if pole == 6 else \
-                          1 if pole == 5 else 0
-        
-        if pole >= 6:
-            coef['m6'] = 84 if pole == 9 else \
-                         28 if pole == 8 else \
-                          7 if pole == 7 else \
-                          1 if pole == 6 else 0
-        
-        if pole >= 7:
-            coef['m7'] = 36 if pole == 9 else \
-                          8 if pole == 8 else \
-                          1 if pole == 7 else 0
-        
-        if pole >= 8:
-            coef['m8'] = 9 if pole == 9 else \
-                         1 if pole == 8 else 0
-        
-        if pole >= 9:
-            coef['m9'] = 1 if pole == 9 else 0
-        
-        # Calculate the filtered series
-        result = np.zeros_like(data, dtype=float)
-        beta = 1 - alpha
-        
-        # Previous values storage for up to 9 poles
-        prev_vals = [0.0] * 10
-        
-        for i in range(len(data)):
-            # Update previous values
-            for j in range(9, 0, -1):
-                prev_vals[j] = prev_vals[j-1]
-            
-            # Calculate new value
-            val = alpha ** pole * data[i]
-            val += pole * beta * prev_vals[1]
-            
-            if pole >= 2:
-                val -= coef['m2'] * (beta ** 2) * prev_vals[2]
-            if pole >= 3:
-                val += coef['m3'] * (beta ** 3) * prev_vals[3]
-            if pole >= 4:
-                val -= coef['m4'] * (beta ** 4) * prev_vals[4]
-            if pole >= 5:
-                val += coef['m5'] * (beta ** 5) * prev_vals[5]
-            if pole >= 6:
-                val -= coef['m6'] * (beta ** 6) * prev_vals[6]
-            if pole >= 7:
-                val += coef['m7'] * (beta ** 7) * prev_vals[7]
-            if pole >= 8:
-                val -= coef['m8'] * (beta ** 8) * prev_vals[8]
-            if pole >= 9:
-                val += coef['m9'] * (beta ** 9) * prev_vals[9]
-            
-            result[i] = val
-            prev_vals[0] = val
-        
-        return result
-    
-    @staticmethod
-    def stochastic_rsi(df: pd.DataFrame,
-                      rsi_length: int = 14,
-                      stoch_length: int = 14, 
-                      k_smoothing: int = 3,
-                      d_smoothing: int = 3,
-                      source_col: str = 'close') -> pd.DataFrame:
+    def stochastic_rsi(df: pd.DataFrame, close_col: str = 'close', 
+                      rsi_period: int = 14, stoch_period: int = 14, k_smoothing: int = 3, 
+                      d_smoothing: int = 3) -> pd.DataFrame:
         """
         Calculate Stochastic RSI indicator.
         
         Args:
             df: DataFrame with price data
-            rsi_length: RSI lookback period
-            stoch_length: Stochastic lookback period
-            k_smoothing: K line smoothing period
-            d_smoothing: D line smoothing period
-            source_col: Source column for calculations
+            close_col: Column name with close prices
+            rsi_period: Period for RSI calculation
+            stoch_period: Period for Stochastic calculation
+            k_smoothing: Smoothing period for K line
+            d_smoothing: Smoothing period for D line
             
         Returns:
-            DataFrame with Stochastic RSI added
+            DataFrame with added columns: rsi, stoch_rsi_k, stoch_rsi_d
         """
-        # Create a copy of the dataframe to avoid modifying the original
+        if len(df) < max(rsi_period, stoch_period) + k_smoothing + d_smoothing:
+            logger.warning("Not enough data for Stochastic RSI calculation")
+            return df.copy()
+        
+        # Create a copy of the input DataFrame to avoid modifying it
         result = df.copy()
         
-        # Ensure source column exists
-        if source_col not in result.columns:
-            logger.error(f"Source column '{source_col}' not found in dataframe")
-            return result
+        # Calculate RSI
+        close_delta = result[close_col].diff()
         
-        # Step 1: Calculate RSI
-        delta = result[source_col].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
+        # Make two series: one for gains and one for losses
+        up = close_delta.clip(lower=0)
+        down = -1 * close_delta.clip(upper=0)
         
-        avg_gain = gain.rolling(window=rsi_length).mean()
-        avg_loss = loss.rolling(window=rsi_length).mean()
+        # Calculate EMAs
+        up_ema = up.ewm(com=rsi_period-1, adjust=False).mean()
+        down_ema = down.ewm(com=rsi_period-1, adjust=False).mean()
         
-        # Handle division by zero
-        rs = avg_gain / avg_loss.replace(0, np.finfo(float).eps)
-        rsi = 100 - (100 / (1 + rs))
+        # Calculate RS and RSI
+        rs = up_ema / down_ema
+        result['rsi'] = 100 - (100 / (1 + rs))
         
-        # Step 2: Calculate Stochastic of RSI
-        rsi_min = rsi.rolling(window=stoch_length).min()
-        rsi_max = rsi.rolling(window=stoch_length).max()
+        # Calculate Stochastic RSI
+        min_rsi = result['rsi'].rolling(window=stoch_period).min()
+        max_rsi = result['rsi'].rolling(window=stoch_period).max()
         
         # Handle division by zero
-        denominator = rsi_max - rsi_min
-        denominator = denominator.replace(0, np.finfo(float).eps)
+        rsi_range = max_rsi - min_rsi
+        rsi_range = np.where(rsi_range == 0, 1, rsi_range)  # Replace 0 with 1 to avoid division by zero
         
-        stoch = 100 * (rsi - rsi_min) / denominator
+        # Calculate raw K values
+        stoch_rsi_k_raw = 100 * ((result['rsi'] - min_rsi) / rsi_range)
         
-        # Step 3: Apply smoothing to K line
-        k = stoch.rolling(window=k_smoothing).mean()
+        # Apply smoothing to K values
+        result['stoch_rsi_k'] = pd.Series(stoch_rsi_k_raw).rolling(window=k_smoothing).mean().values
         
-        # Step 4: Calculate D line (moving average of K)
-        d = k.rolling(window=d_smoothing).mean()
-        
-        # Add calculated values to the result dataframe
-        result['rsi'] = rsi
-        result['stoch_rsi_k'] = k
-        result['stoch_rsi_d'] = d
+        # Calculate D values (simple moving average of K)
+        result['stoch_rsi_d'] = result['stoch_rsi_k'].rolling(window=d_smoothing).mean()
         
         return result
     
     @staticmethod
-    def volume_ma(df: pd.DataFrame, 
-                 length: int = 20, 
-                 source_col: str = 'volume') -> pd.DataFrame:
+    def volume_analysis(df: pd.DataFrame, volume_col: str = 'volume', 
+                       ma_period: int = 20) -> pd.DataFrame:
         """
-        Calculate Volume Moving Average.
+        Calculate volume indicators.
         
         Args:
             df: DataFrame with price and volume data
-            length: Moving average period
-            source_col: Source column for calculations
+            volume_col: Column name with volume data
+            ma_period: Period for the volume moving average
             
         Returns:
-            DataFrame with Volume MA added
+            DataFrame with added column: volume_ma
         """
-        # Create a copy of the dataframe to avoid modifying the original
+        if len(df) < ma_period:
+            logger.warning(f"Not enough data for volume analysis. Need at least {ma_period} data points.")
+            return df.copy()
+            
+        # Create a copy of the input DataFrame to avoid modifying it
         result = df.copy()
         
-        # Ensure source column exists
-        if source_col not in result.columns:
-            logger.error(f"Source column '{source_col}' not found in dataframe")
-            return result
-        
-        # Calculate simple moving average of volume
-        result['volume_ma'] = result[source_col].rolling(window=length).mean()
+        # Calculate volume moving average
+        result['volume_ma'] = result[volume_col].rolling(window=ma_period).mean()
         
         return result
-    
+        
     @staticmethod
-    def atr(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    def atr(df: pd.DataFrame, period: int = 14, 
+           high_col: str = 'high', low_col: str = 'low', close_col: str = 'close') -> pd.DataFrame:
         """
         Calculate Average True Range (ATR).
         
         Args:
-            df: DataFrame with price data (must have 'high', 'low', 'close')
-            length: ATR period
+            df: DataFrame with price data
+            period: Period for ATR calculation
+            high_col: Column name with high prices
+            low_col: Column name with low prices
+            close_col: Column name with close prices
             
         Returns:
-            DataFrame with ATR added
+            DataFrame with added column: atr
         """
-        # Create a copy of the dataframe to avoid modifying the original
+        if len(df) < period + 1:
+            logger.warning(f"Not enough data for ATR calculation. Need at least {period + 1} data points.")
+            return df.copy()
+            
+        # Create a copy of the input DataFrame to avoid modifying it
         result = df.copy()
         
-        # Check required columns
-        if not all(col in result.columns for col in ['high', 'low', 'close']):
-            logger.error("ATR calculation requires high, low, and close columns")
-            return result
+        # Calculate True Range
+        result['tr0'] = abs(result[high_col] - result[low_col])
+        result['tr1'] = abs(result[high_col] - result[close_col].shift())
+        result['tr2'] = abs(result[low_col] - result[close_col].shift())
+        result['tr'] = result[['tr0', 'tr1', 'tr2']].max(axis=1)
         
-        # Calculate true range
-        high_low = result['high'] - result['low']
-        high_close_prev = np.abs(result['high'] - result['close'].shift(1))
-        low_close_prev = np.abs(result['low'] - result['close'].shift(1))
+        # Calculate ATR
+        result['atr'] = result['tr'].ewm(span=period, adjust=False).mean()
         
-        tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
-        
-        # Calculate ATR (simple moving average of true range)
-        result['atr'] = tr.rolling(window=length).mean()
+        # Drop temporary columns
+        result.drop(columns=['tr0', 'tr1', 'tr2', 'tr'], inplace=True)
         
         return result
-    
+        
     @staticmethod
-    def calculate_all_indicators(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+    def add_all_indicators(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
         """
-        Calculate all indicators needed for the Gaussian Channel strategy.
+        Add all indicators required by the Gaussian Channel strategy.
         
         Args:
             df: DataFrame with price and volume data
-            config: Configuration dictionary with indicator parameters
+            config: Strategy configuration
             
         Returns:
             DataFrame with all indicators added
         """
-        # Extract indicator parameters from config
-        strategy_params = config.get('strategy', {}).get('params', {})
+        # Extract parameters from config or use defaults
+        gc_params = config.get('strategy', {}).get('params', {}).get('gaussian_channel', {})
+        gc_period = gc_params.get('period', 144)
+        gc_multiplier = gc_params.get('multiplier', 1.2)
         
-        # Gaussian Channel parameters
-        gc_period = strategy_params.get('gc_period', 144)
-        gc_multiplier = strategy_params.get('gc_multiplier', 1.2)
-        gc_poles = strategy_params.get('gc_poles', 4)
+        stoch_params = config.get('strategy', {}).get('params', {}).get('stochastic_rsi', {})
+        rsi_period = stoch_params.get('rsi_period', 14)
+        stoch_period = stoch_params.get('stoch_period', 14)
+        k_smoothing = stoch_params.get('k_smoothing', 3)
+        d_smoothing = stoch_params.get('d_smoothing', 3)
         
-        # Stochastic RSI parameters
-        rsi_length = strategy_params.get('stoch_rsi_length', 14)
-        stoch_length = strategy_params.get('stoch_length', 14)
-        k_smooth = strategy_params.get('stoch_k_smooth', 3)
+        volume_params = config.get('strategy', {}).get('params', {}).get('volume', {})
+        volume_ma_period = volume_params.get('ma_period', 20)
         
-        # Volume MA parameters
-        vol_ma_length = strategy_params.get('vol_ma_length', 20)
+        atr_params = config.get('strategy', {}).get('params', {}).get('atr', {})
+        atr_period = atr_params.get('period', 14)
         
-        # ATR parameters
-        atr_length = strategy_params.get('atr_length', 14)
-        
-        # Create a copy of the dataframe to avoid modifying the original
+        # Apply indicators
         result = df.copy()
         
-        # Calculate HLC3 (typical price) if not already present
-        if 'hlc3' not in result.columns:
-            result['hlc3'] = (result['high'] + result['low'] + result['close']) / 3
-        
-        # Calculate each indicator
-        logger.info("Calculating indicators")
-        
-        # Step 1: ATR
-        result = Indicators.atr(result, atr_length)
-        
-        # Step 2: Gaussian Channel
+        # Add Gaussian Channel indicator
         result = Indicators.gaussian_channel(
             result, 
-            source_col='hlc3',
             period=gc_period,
-            multiplier=gc_multiplier,
-            poles=gc_poles
+            multiplier=gc_multiplier
         )
         
-        # Step 3: Stochastic RSI
+        # Add Stochastic RSI
         result = Indicators.stochastic_rsi(
             result,
-            rsi_length=rsi_length,
-            stoch_length=stoch_length,
-            k_smoothing=k_smooth
+            rsi_period=rsi_period,
+            stoch_period=stoch_period,
+            k_smoothing=k_smoothing,
+            d_smoothing=d_smoothing
         )
         
-        # Step 4: Volume MA
-        if 'volume' in result.columns:
-            result = Indicators.volume_ma(
-                result,
-                length=vol_ma_length
-            )
-        else:
-            logger.warning("Volume data not available, skipping Volume MA calculation")
+        # Add Volume Analysis
+        result = Indicators.volume_analysis(
+            result,
+            ma_period=volume_ma_period
+        )
         
-        logger.info("Indicator calculation complete")
+        # Add ATR
+        result = Indicators.atr(
+            result,
+            period=atr_period
+        )
+        
         return result
