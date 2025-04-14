@@ -33,15 +33,47 @@ class NotificationManager:
         self.config = config
         self.notifications_config = config.get('notifications', {})
         
-        # Discord configuration
+        # Discord configuration - updated to support multiple webhooks
         self.discord_enabled = self.notifications_config.get('discord', {}).get('enabled', False)
-        self.discord_webhook_url = self.notifications_config.get('discord', {}).get('webhook_url', '')
         
-        if self.discord_enabled and not self.discord_webhook_url:
-            logger.warning("Discord notifications are enabled but webhook URL is not configured")
-            self.discord_enabled = False
+        # Get webhook URLs for different notification types
+        self.webhooks = {}
+        discord_config = self.notifications_config.get('discord', {})
+        
+        if self.discord_enabled and 'webhooks' in discord_config:
+            self.webhooks = discord_config.get('webhooks', {})
+            
+            # Check if we have at least one valid webhook
+            if not any(self.webhooks.values()):
+                logger.warning("Discord notifications are enabled but no webhook URLs are configured")
+                self.discord_enabled = False
+        else:
+            # Fallback to single webhook URL for backwards compatibility
+            single_webhook = discord_config.get('webhook_url', '')
+            if single_webhook:
+                # Use the same URL for all notification types
+                self.webhooks = {
+                    'trade_alerts': single_webhook,
+                    'performance': single_webhook,
+                    'signals': single_webhook,
+                    'system_status': single_webhook
+                }
+            else:
+                logger.warning("Discord notifications are enabled but webhook URLs are not configured")
+                self.discord_enabled = False
+        
+        # Get notification levels
+        self.notification_levels = self.notifications_config.get('notification_levels', {
+            'trade_alerts': True,
+            'performance': True,
+            'signals': True,
+            'system_status': True
+        })
             
         logger.info(f"Notification manager initialized. Discord enabled: {self.discord_enabled}")
+        if self.discord_enabled:
+            configured_channels = [k for k, v in self.webhooks.items() if v]
+            logger.info(f"Configured Discord channels: {', '.join(configured_channels)}")
     
     def send_signal_notification(self, signal: Signal) -> bool:
         """
@@ -53,7 +85,7 @@ class NotificationManager:
         Returns:
             True if notification was sent successfully, False otherwise
         """
-        if not self.discord_enabled:
+        if not self.discord_enabled or not self.notification_levels.get('signals', True):
             return False
             
         # Create signal message
@@ -109,7 +141,12 @@ class NotificationManager:
             ]
         }
         
-        return self._send_discord_message(embeds=[embed])
+        webhook_url = self.webhooks.get('signals')
+        if not webhook_url:
+            logger.warning("Signal notification not sent: No webhook URL configured for signals")
+            return False
+            
+        return self._send_discord_message(webhook_url, embeds=[embed])
     
     def send_trade_execution_notification(self, trade_details: Dict[str, Any]) -> bool:
         """
@@ -121,7 +158,7 @@ class NotificationManager:
         Returns:
             True if notification was sent successfully, False otherwise
         """
-        if not self.discord_enabled:
+        if not self.discord_enabled or not self.notification_levels.get('trade_alerts', True):
             return False
         
         # Extract trade details
@@ -186,7 +223,12 @@ class NotificationManager:
                 "inline": True
             })
         
-        return self._send_discord_message(embeds=[embed])
+        webhook_url = self.webhooks.get('trade_alerts')
+        if not webhook_url:
+            logger.warning("Trade notification not sent: No webhook URL configured for trade alerts")
+            return False
+            
+        return self._send_discord_message(webhook_url, embeds=[embed])
     
     def send_error_notification(self, error_message: str, error_details: Optional[str] = None) -> bool:
         """
@@ -199,7 +241,7 @@ class NotificationManager:
         Returns:
             True if notification was sent successfully, False otherwise
         """
-        if not self.discord_enabled:
+        if not self.discord_enabled or not self.notification_levels.get('system_status', True):
             return False
             
         title = "⚠️ SYSTEM ERROR"
@@ -225,7 +267,12 @@ class NotificationManager:
                 }
             ]
         
-        return self._send_discord_message(embeds=[embed])
+        webhook_url = self.webhooks.get('system_status')
+        if not webhook_url:
+            logger.warning("Error notification not sent: No webhook URL configured for system status")
+            return False
+            
+        return self._send_discord_message(webhook_url, embeds=[embed])
     
     def send_system_notification(self, title: str, message: str, level: str = "info") -> bool:
         """
@@ -239,7 +286,7 @@ class NotificationManager:
         Returns:
             True if notification was sent successfully, False otherwise
         """
-        if not self.discord_enabled:
+        if not self.discord_enabled or not self.notification_levels.get('system_status', True):
             return False
             
         # Set color based on level
@@ -264,7 +311,12 @@ class NotificationManager:
             }
         }
         
-        return self._send_discord_message(embeds=[embed])
+        webhook_url = self.webhooks.get('system_status')
+        if not webhook_url:
+            logger.warning("System notification not sent: No webhook URL configured for system status")
+            return False
+            
+        return self._send_discord_message(webhook_url, embeds=[embed])
     
     def send_daily_summary(self, summary: Dict[str, Any]) -> bool:
         """
@@ -276,7 +328,7 @@ class NotificationManager:
         Returns:
             True if notification was sent successfully, False otherwise
         """
-        if not self.discord_enabled:
+        if not self.discord_enabled or not self.notification_levels.get('performance', True):
             return False
             
         # Extract summary data
@@ -308,7 +360,7 @@ class NotificationManager:
         embed = {
             "title": title,
             "description": description,
-            "color": 7506394,  # Green if profitable, red if not
+            "color": 7506394 if pnl >= 0 else 16711680,  # Green if profitable, red if not
             "timestamp": datetime.utcnow().isoformat(),
             "footer": {
                 "text": "ZT-3 Trading System"
@@ -342,20 +394,26 @@ class NotificationManager:
                     "inline": True
                 })
         
-        return self._send_discord_message(embeds=[embed])
+        webhook_url = self.webhooks.get('performance')
+        if not webhook_url:
+            logger.warning("Performance notification not sent: No webhook URL configured for performance")
+            return False
+            
+        return self._send_discord_message(webhook_url, embeds=[embed])
     
-    def _send_discord_message(self, content: Optional[str] = None, embeds: Optional[List[Dict[str, Any]]] = None) -> bool:
+    def _send_discord_message(self, webhook_url: str, content: Optional[str] = None, embeds: Optional[List[Dict[str, Any]]] = None) -> bool:
         """
         Send a message to Discord using webhook.
         
         Args:
+            webhook_url: Discord webhook URL
             content: Text content of the message
             embeds: List of Discord embeds
             
         Returns:
             True if message was sent successfully, False otherwise
         """
-        if not self.discord_enabled or not self.discord_webhook_url:
+        if not self.discord_enabled or not webhook_url:
             return False
             
         payload = {}
@@ -369,7 +427,7 @@ class NotificationManager:
         try:
             headers = {"Content-Type": "application/json"}
             response = requests.post(
-                self.discord_webhook_url, 
+                webhook_url, 
                 data=json.dumps(payload), 
                 headers=headers
             )

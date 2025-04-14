@@ -58,6 +58,14 @@ class UpstoxBroker:
             'Accept': 'application/json'
         })
         
+        # Order tracking
+        self.active_orders = {}  # order_id -> order details
+        self.order_callbacks = {}  # order_id -> callback function
+        self.order_status_callbacks = []  # List of general status callbacks
+        
+        # Market data client - will be initialized separately
+        self.market_data_client = None
+        
         # Load token from file if available
         self._load_token_from_file()
         
@@ -578,6 +586,21 @@ class UpstoxBroker:
         success, response = self._api_request('POST', 'order/place', data=payload)
         if success:
             order_data = response.get('data', {})
+            order_id = order_data.get('order_id', '')
+            
+            # Store order details for tracking
+            if order_id:
+                self.active_orders[order_id] = {
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'transaction_type': transaction_type,
+                    'quantity': quantity,
+                    'order_type': order_type,
+                    'price': price,
+                    'status': 'PLACED',
+                    'timestamp': datetime.now().isoformat()
+                }
+            
             logger.info(f"Order placed: {transaction_type} {quantity} {symbol} @ {order_type}")
             return order_data
         return {}
@@ -620,6 +643,16 @@ class UpstoxBroker:
         success, response = self._api_request('PUT', f"order/modify/{order_id}", data=payload)
         if success:
             order_data = response.get('data', {})
+            
+            # Update stored order details
+            if order_id in self.active_orders:
+                if quantity is not None:
+                    self.active_orders[order_id]['quantity'] = quantity
+                if price is not None:
+                    self.active_orders[order_id]['price'] = price
+                self.active_orders[order_id]['status'] = 'MODIFIED'
+                self.active_orders[order_id]['modified_at'] = datetime.now().isoformat()
+                
             logger.info(f"Order {order_id} modified successfully")
             return order_data
         return {}
@@ -636,6 +669,355 @@ class UpstoxBroker:
         """
         success, response = self._api_request('DELETE', f"order/cancel/{order_id}")
         if success:
+            # Update stored order details
+            if order_id in self.active_orders:
+                self.active_orders[order_id]['status'] = 'CANCELLED'
+                self.active_orders[order_id]['cancelled_at'] = datetime.now().isoformat()
+                
             logger.info(f"Order {order_id} cancelled successfully")
             return True
         return False
+
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        """
+        Get the current status of an order.
+        
+        Args:
+            order_id: ID of the order to check
+            
+        Returns:
+            Order details including current status.
+        """
+        success, response = self._api_request('GET', f"order/{order_id}")
+        if success:
+            order_data = response.get('data', {})
+            
+            # Update stored order details
+            if order_id in self.active_orders:
+                self.active_orders[order_id]['status'] = order_data.get('status', 'UNKNOWN')
+                self.active_orders[order_id]['last_updated'] = datetime.now().isoformat()
+                
+            return order_data
+        return {}
+    
+    def register_order_callback(self, order_id: str, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """
+        Register a callback for an order status change.
+        
+        Args:
+            order_id: Order ID to track
+            callback: Function to call when order status changes
+        """
+        self.order_callbacks[order_id] = callback
+    
+    def register_status_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """
+        Register a callback for all order status updates.
+        
+        Args:
+            callback: Function to call for any order status change
+        """
+        self.order_status_callbacks.append(callback)
+    
+    def unregister_status_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """
+        Unregister a previously registered status callback.
+        
+        Args:
+            callback: Callback function to remove
+        """
+        if callback in self.order_status_callbacks:
+            self.order_status_callbacks.remove(callback)
+    
+    def poll_orders_status(self) -> None:
+        """
+        Poll for status updates of all active orders.
+        
+        This is a fallback for when WebSocket updates are not available.
+        """
+        # Get all orders for the day
+        all_orders = self.get_orders()
+        
+        for order in all_orders:
+            order_id = order.get('order_id')
+            status = order.get('status')
+            
+            # Check if this is an order we're tracking and if status has changed
+            if order_id in self.active_orders:
+                old_status = self.active_orders[order_id].get('status')
+                
+                if old_status != status:
+                    # Update stored status
+                    self.active_orders[order_id]['status'] = status
+                    self.active_orders[order_id]['last_updated'] = datetime.now().isoformat()
+                    
+                    # Call order-specific callback if registered
+                    if order_id in self.order_callbacks:
+                        try:
+                            self.order_callbacks[order_id](order)
+                        except Exception as e:
+                            logger.error(f"Error in order callback for {order_id}: {e}")
+                    
+                    # Call general status callbacks
+                    for callback in self.order_status_callbacks:
+                        try:
+                            callback(order)
+                        except Exception as e:
+                            logger.error(f"Error in status callback: {e}")
+    
+    def calculate_position_size(self, 
+                               symbol: str, 
+                               price: float, 
+                               capital: float, 
+                               capital_percent: float) -> int:
+        """
+        Calculate position size based on available capital.
+        
+        Args:
+            symbol: Trading symbol
+            price: Current price
+            capital: Available capital
+            capital_percent: Percentage of capital to use (e.g., 95.0)
+            
+        Returns:
+            Number of shares to trade (rounded down to integer)
+        """
+        allocation = capital * (capital_percent / 100)
+        
+        # Check if position size would exceed available capital
+        if price > allocation:
+            logger.warning(f"Price {price} for {symbol} exceeds capital allocation {allocation}")
+            return 0
+            
+        # Calculate number of shares (round down to integer)
+        shares = int(allocation / price)
+        
+        logger.debug(f"Calculated position size for {symbol}: {shares} @ {price} " 
+                   f"(allocation: ₹{allocation:.2f} of ₹{capital:.2f})")
+        return shares
+    
+    def check_market_hours(self) -> bool:
+        """
+        Check if the market is currently open.
+        
+        Returns:
+            bool: True if market is open
+        """
+        # TODO: Implement proper market hours check for Indian markets
+        # For now, a simple check based on day of week and time
+        now = datetime.now()
+        
+        # Check if it's a weekday (0=Monday, 6=Sunday)
+        if now.weekday() >= 5:  # Saturday or Sunday
+            return False
+            
+        # Check if time is between 9:15 AM and 3:30 PM IST
+        market_open = now.replace(hour=9, minute=15, second=0)
+        market_close = now.replace(hour=15, minute=30, second=0)
+        
+        return market_open <= now <= market_close
+    
+    def execute_trade_from_signal(self, signal, available_capital: float, capital_percent: float = 95.0) -> Dict[str, Any]:
+        """
+        Execute a trade based on a trading signal.
+        
+        Args:
+            signal: Trading signal object from strategy
+            available_capital: Available capital for trading
+            capital_percent: Percentage of capital to use
+            
+        Returns:
+            Dict with trade execution details
+        """
+        if not self.is_authenticated():
+            logger.error("Not authenticated with Upstox API")
+            return {'success': False, 'error': 'Not authenticated'}
+            
+        # Check if market is open
+        if not self.check_market_hours():
+            logger.warning("Market is closed, cannot execute trade")
+            return {'success': False, 'error': 'Market closed'}
+            
+        try:
+            symbol = signal.symbol
+            signal_type = signal.signal_type
+            price = signal.price
+            
+            # Extract symbol and exchange
+            if ':' in symbol:
+                exchange, symbol_name = symbol.split(':')
+            else:
+                # Default to NSE if not specified
+                exchange = 'NSE'
+                symbol_name = symbol
+            
+            if signal_type == 'ENTRY':
+                # Calculate position size
+                quantity = self.calculate_position_size(
+                    symbol=symbol_name,
+                    price=price,
+                    capital=available_capital,
+                    capital_percent=capital_percent
+                )
+                
+                if quantity <= 0:
+                    logger.warning(f"Calculated position size is zero for {symbol}")
+                    return {'success': False, 'error': 'Insufficient capital for trade'}
+                
+                # Place buy order
+                order_result = self.place_order(
+                    symbol=symbol_name,
+                    exchange=exchange,
+                    transaction_type='BUY',
+                    quantity=quantity,
+                    product='I',  # Intraday
+                    order_type='LIMIT',  # Use LIMIT for more predictable fills
+                    price=price * 1.002,  # Slightly higher than current price to ensure fill
+                    tag='ZT3_ENTRY'
+                )
+                
+                if not order_result:
+                    return {'success': False, 'error': 'Order placement failed'}
+                
+                order_id = order_result.get('order_id', '')
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'symbol': symbol,
+                    'quantity': quantity,
+                    'price': price,
+                    'transaction_type': 'BUY',
+                    'signal_type': 'ENTRY'
+                }
+                
+            elif signal_type == 'EXIT':
+                # Get current position for this symbol
+                positions = self.get_positions()
+                position = next((p for p in positions if p.get('symbol') == f"{exchange}:{symbol_name}"), None)
+                
+                if not position:
+                    logger.warning(f"No open position found for {symbol}")
+                    return {'success': False, 'error': 'No position to exit'}
+                
+                quantity = position.get('quantity', 0)
+                
+                if quantity <= 0:
+                    logger.warning(f"Position for {symbol} has zero quantity")
+                    return {'success': False, 'error': 'Zero quantity position'}
+                
+                # Place sell order
+                order_result = self.place_order(
+                    symbol=symbol_name,
+                    exchange=exchange,
+                    transaction_type='SELL',
+                    quantity=quantity,
+                    product='I',  # Intraday
+                    order_type='LIMIT',  # Use LIMIT for more predictable fills
+                    price=price * 0.998,  # Slightly lower to ensure fill
+                    tag='ZT3_EXIT'
+                )
+                
+                if not order_result:
+                    return {'success': False, 'error': 'Order placement failed'}
+                
+                order_id = order_result.get('order_id', '')
+                exit_reason = signal.exit_reason.value if hasattr(signal, 'exit_reason') and signal.exit_reason else 'UNKNOWN'
+                
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'symbol': symbol,
+                    'quantity': quantity,
+                    'price': price,
+                    'transaction_type': 'SELL',
+                    'signal_type': 'EXIT',
+                    'exit_reason': exit_reason
+                }
+            else:
+                return {'success': False, 'error': f'Unknown signal type: {signal_type}'}
+                
+        except Exception as e:
+            logger.error(f"Error executing trade from signal: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def close_all_positions(self) -> List[Dict[str, Any]]:
+        """
+        Close all open positions.
+        
+        Returns:
+            List of order results from closing positions
+        """
+        if not self.is_authenticated():
+            logger.error("Not authenticated with Upstox API")
+            return []
+            
+        # Get all open positions
+        positions = self.get_positions()
+        if not positions:
+            logger.info("No open positions to close")
+            return []
+            
+        results = []
+        
+        for position in positions:
+            symbol = position.get('symbol', '')
+            quantity = position.get('quantity', 0)
+            
+            if not symbol or quantity <= 0:
+                continue
+                
+            # Extract exchange and symbol
+            if ':' in symbol:
+                exchange, symbol_name = symbol.split(':')
+            else:
+                continue  # Skip if can't determine exchange
+                
+            # Place sell order to close position
+            try:
+                order_result = self.place_order(
+                    symbol=symbol_name,
+                    exchange=exchange,
+                    transaction_type='SELL',
+                    quantity=quantity,
+                    product='I',  # Intraday
+                    order_type='MARKET',  # Use MARKET to ensure immediate execution
+                    tag='ZT3_EOD_CLOSE'
+                )
+                
+                if order_result:
+                    results.append({
+                        'success': True,
+                        'symbol': symbol,
+                        'quantity': quantity,
+                        'order_id': order_result.get('order_id', ''),
+                        'message': 'Position closed'
+                    })
+                    logger.info(f"Closed position for {symbol}: {quantity} shares")
+                else:
+                    results.append({
+                        'success': False,
+                        'symbol': symbol,
+                        'quantity': quantity,
+                        'message': 'Failed to close position'
+                    })
+                    logger.error(f"Failed to close position for {symbol}")
+                    
+            except Exception as e:
+                logger.error(f"Error closing position for {symbol}: {e}")
+                results.append({
+                    'success': False,
+                    'symbol': symbol,
+                    'quantity': quantity,
+                    'message': f'Error: {str(e)}'
+                })
+                
+        return results
+        
+    def set_market_data_client(self, client) -> None:
+        """
+        Set the market data client for this broker.
+        
+        Args:
+            client: MarketDataClient instance
+        """
+        self.market_data_client = client

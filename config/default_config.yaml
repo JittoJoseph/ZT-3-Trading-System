@@ -1,89 +1,97 @@
-# ZT-3 Trading System Configuration
+# Default Configuration for ZT-3 Trading System
 
-# API credentials for Upstox
+# API Credentials
 api:
-  api_key: "your_upstox_api_key"
-  api_secret: "your_upstox_api_secret"
-  redirect_uri: "https://127.0.0.1:5000/callback" # For OAuth flow
+  api_key: "${UPSTOX_API_KEY}" # Set via environment variable
+  api_secret: "${UPSTOX_API_SECRET}" # Set via environment variable
+  redirect_uri: "http://localhost:3000/callback" # Local redirect for OAuth flow
 
-# Symbols to monitor and trade
+# Trading Symbols
 symbols:
   - ticker: "PNB"
     exchange: "NSE"
+    name: "Punjab National Bank"
+    min_qty: 1
+    tick_size: 0.05
+    lot_size: 1
   - ticker: "SBIN"
     exchange: "NSE"
+    name: "State Bank of India"
+    min_qty: 1
+    tick_size: 0.05
+    lot_size: 1
   - ticker: "BANKBARODA"
     exchange: "NSE"
+    name: "Bank of Baroda"
+    min_qty: 1
+    tick_size: 0.05
+    lot_size: 1
 
-# Strategy configuration
+# Strategy Configuration
 strategy:
   name: "GaussianChannel"
   params:
-    # Gaussian Channel parameters
-    gc_source: "hlc3" # Source for price calculation (hlc3, ohlc4, close)
-    gc_poles: 4 # Number of poles for filter
-    gc_period: 144 # Sampling period
-    gc_multiplier: 1.2 # True range multiplier
-    gc_reduced_lag_mode: false # Lag reduction mode
-    gc_fast_response_mode: false # Fast response mode
+    gc_period: 144
+    gc_multiplier: 1.2
+    stoch_rsi_length: 14
+    stoch_length: 14
+    stoch_k_smooth: 3
+    stoch_upper_band: 80.0
+    atr_length: 14
+    atr_tp_multiplier: 4.0
+    volume_ma_length: 20
 
-    # Stochastic RSI parameters
-    stoch_rsi_length: 14 # RSI length
-    stoch_length: 14 # Stochastic length
-    stoch_k_smooth: 3 # K line smoothing
-    stoch_d_smooth: 3 # D line smoothing
-    stoch_upper_band: 80.0 # Upper threshold
-
-    # Volume filter
-    use_volume_filter: true # Whether to use volume filter
-    volume_ma_length: 20 # Volume MA period
-
-    # Take profit and trailing stop
-    atr_length: 14 # ATR period
-    use_take_profit: true # Whether to use take profit
-    atr_multiplier_tp: 4.0 # ATR multiplier for take profit
-    use_trailing_stop: false # Whether to use trailing stop
-    atr_multiplier_tsl: 2.0 # ATR multiplier for trailing stop
-
-# Risk management settings
+# Risk Management Settings
 risk:
-  capital_percent: 95.0 # Percentage of available capital to use per trade
-  max_daily_loss: 5.0 # Maximum daily loss percentage
-  max_daily_trades: 5 # Maximum number of trades per day
-  circuit_breaker: true # Enable circuit breaker
-  end_of_day_closure: true # Close all positions at end of day
+  max_daily_loss: 5.0 # Percentage of capital
+  max_daily_trades: 5
+  capital_percent: 95.0 # Percentage of capital to allocate per trade
+  circuit_breaker_enabled: true
+  end_of_day_closure: true
+  end_of_day_time: "15:15" # HH:MM in 24-hour format
 
-# Paper trading settings
+# Paper Trading Settings
 paper_trading:
-  enabled: true # Start in paper trading mode by default
-  starting_capital: 3000.0 # Initial capital
-  simulate_slippage: true # Simulate slippage
-  slippage_percent: 0.1 # Slippage percentage
+  enabled: true
+  starting_capital: 3000.0 # Initial paper trading capital
+  simulate_slippage: true
+  slippage_percent: 0.1
+  commission_percent: 0.03
 
-# Execution settings
+# Order Execution Settings
 execution:
-  order_type: "MARKET" # Order type (MARKET, LIMIT)
-  slippage_tolerance: 0.1 # Slippage tolerance for limit orders
-  retry_attempts: 3 # Number of retry attempts for failed orders
-  retry_delay: 2 # Delay between retry attempts (seconds)
+  order_type: "LIMIT"
+  slippage_tolerance: 0.1
+  retry_attempts: 3
+  retry_delay: 2
 
-# Discord notification webhooks
+# Notifications
 notifications:
-  discord_webhooks:
-    trade_alerts: "webhook_url_for_trade_alerts"
-    performance: "webhook_url_for_performance"
-    signals: "webhook_url_for_signals"
-    system_status: "webhook_url_for_system_status"
+  discord:
+    enabled: true
+    webhooks:
+      trade_alerts: "${DISCORD_WEBHOOK_TRADE_ALERTS}" # For buy/sell trade execution notifications
+      performance: "${DISCORD_WEBHOOK_PERFORMANCE}" # For daily performance summaries
+      signals: "${DISCORD_WEBHOOK_SIGNALS}" # For strategy signal notifications
+      system_status: "${DISCORD_WEBHOOK_SYSTEM}" # For system health monitoring
   notification_levels:
     trade_alerts: true
     performance: true
     signals: true
     system_status: true
 
-# Logging settings
+# Logging
 logging:
-  level: "INFO" # Logging level (DEBUG, INFO, WARNING, ERROR)
-  file: "logs/zt3.log" # Log file path
-  max_size_mb: 10 # Maximum log file size in MB
-  backup_count: 5 # Number of backup files to keep
-  trade_log: "logs/trades.log" # Trade log file path
+  level: "INFO"
+  file: "logs/zt3.log"
+  max_size_mb: 10
+  backup_count: 5
+  trade_log: "logs/trades.log"
+
+# Data Storage
+data:
+  save_candles: true
+  save_signals: true
+  save_trades: true
+  storage_path: "data/storage"
+  cache_historical_data: true
