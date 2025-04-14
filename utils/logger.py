@@ -1,72 +1,146 @@
 """
-Logging utility for ZT-3 Trading System.
+Logging setup for ZT-3 Trading System.
 
-This module handles setting up logging with appropriate handlers
-for file and console output.
+This module configures the Python logging system with appropriate
+formatting and handlers for different log types.
 """
 
+import logging
+import logging.handlers
 import os
 import sys
-import logging
-from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Union, Optional
 
-def setup_logging(config: Dict[str, Any] = None) -> None:
+def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
     """
-    Setup logging for the application.
+    Configure logging with console and file handlers.
     
     Args:
-        config: Configuration dictionary with logging settings.
-               If not provided, default settings will be used.
+        config: Optional configuration dictionary with logging settings.
     """
-    if config is None:
-        config = {
-            'level': 'INFO',
-            'file': 'logs/zt3.log',
-            'max_size_mb': 10,
-            'backup_count': 5
-        }
-    
     # Create logs directory if it doesn't exist
-    log_file = Path(config.get('file', 'logs/zt3.log'))
-    log_dir = log_file.parent
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
     
-    # Get the log level
-    level_name = config.get('level', 'INFO').upper()
-    level = getattr(logging, level_name, logging.INFO)
+    # Get logging configuration from config or use defaults
+    log_level_name = "INFO"
+    log_file = "logs/zt3.log"
+    max_size_mb = 10
+    backup_count = 5
+    trade_log = "logs/trades.log"
+    
+    if config and 'logging' in config:
+        log_config = config['logging']
+        log_level_name = log_config.get('level', log_level_name)
+        log_file = log_config.get('file', log_file)
+        max_size_mb = log_config.get('max_size_mb', max_size_mb)
+        backup_count = log_config.get('backup_count', backup_count)
+        trade_log = log_config.get('trade_log', trade_log)
+    
+    # Map string log level to logging constants
+    log_level_map = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+        'CRITICAL': logging.CRITICAL
+    }
+    log_level = log_level_map.get(log_level_name.upper(), logging.INFO)
     
     # Configure root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(level)
+    root_logger.setLevel(log_level)
     
-    # Clear existing handlers
+    # Remove existing handlers to prevent duplicates
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
     
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # Create formatters
+    console_formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        datefmt='%H:%M:%S'
     )
     
-    # Setup console handler
+    file_formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(name)s (%(filename)s:%(lineno)d): %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Create console handler
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(console_formatter)
+    console_handler.setLevel(log_level)
     root_logger.addHandler(console_handler)
     
-    # Setup file handler
-    max_size_bytes = config.get('max_size_mb', 10) * 1024 * 1024
-    backup_count = config.get('backup_count', 5)
-    
-    file_handler = RotatingFileHandler(
+    # Create rotating file handler for main log
+    main_file_handler = logging.handlers.RotatingFileHandler(
         log_file,
-        maxBytes=max_size_bytes,
-        backupCount=backup_count,
-        encoding='utf-8'
+        maxBytes=max_size_mb * 1024 * 1024,  # Convert MB to bytes
+        backupCount=backup_count
     )
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
+    main_file_handler.setFormatter(file_formatter)
+    main_file_handler.setLevel(log_level)
+    root_logger.addHandler(main_file_handler)
     
-    # Log startup
-    logging.info(f"Logging initialized at level {level_name}")
+    # Create trade logger (for trade-specific logging)
+    trade_logger = logging.getLogger('trades')
+    trade_logger.propagate = False  # Don't propagate to parent logger
+    trade_logger.setLevel(logging.INFO)
+    
+    # Create trade log formatter
+    trade_formatter = logging.Formatter('%(asctime)s|%(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    
+    # Create trade log handler
+    trade_file_handler = logging.handlers.RotatingFileHandler(
+        trade_log,
+        maxBytes=max_size_mb * 1024 * 1024,
+        backupCount=backup_count
+    )
+    trade_file_handler.setFormatter(trade_formatter)
+    trade_logger.addHandler(trade_file_handler)
+    
+    # Log startup message
+    logging.info(f"Logging initialized at {log_level_name} level")
+    logging.info(f"Main log file: {log_file}")
+    logging.info(f"Trade log file: {trade_log}")
+
+def log_trade(action: str, symbol: str, price: float, quantity: int, 
+             reason: str = None, pnl: float = None) -> None:
+    """
+    Log a trade to the dedicated trade log file.
+    
+    Args:
+        action: Trade action (BUY, SELL)
+        symbol: Trading symbol
+        price: Trade price
+        quantity: Number of shares
+        reason: Optional reason for the trade
+        pnl: Optional profit/loss for the trade
+    """
+    trade_logger = logging.getLogger('trades')
+    
+    # Format trade message in pipe-separated format for easy parsing
+    msg_parts = [action, symbol, f"{price:.2f}", str(quantity)]
+    
+    if reason:
+        msg_parts.append(reason)
+    else:
+        msg_parts.append("N/A")
+        
+    if pnl is not None:
+        msg_parts.append(f"{pnl:.2f}")
+    else:
+        msg_parts.append("N/A")
+        
+    trade_logger.info('|'.join(msg_parts))
+
+def get_trade_logger():
+    """
+    Get the dedicated trade logger.
+    
+    Returns:
+        Logger instance for trade logging
+    """
+    return logging.getLogger('trades')
