@@ -74,6 +74,7 @@ notifications:
       performance: "${DISCORD_WEBHOOK_PERFORMANCE}" # For daily performance summaries
       signals: "${DISCORD_WEBHOOK_SIGNALS}" # For strategy signal notifications
       system_status: "${DISCORD_WEBHOOK_SYSTEM}" # For system health monitoring
+      backtest_results: "${DISCORD_WEBHOOK_BACKTEST}" # For detailed backtest results
   notification_levels:
     trade_alerts: true
     performance: true

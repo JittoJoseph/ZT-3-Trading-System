@@ -6,6 +6,7 @@
 - [Configuration](#configuration)
 - [Authentication](#authentication)
 - [Trading Modes](#trading-modes)
+- [Backtesting](#backtesting)
 - [Discord Notifications](#discord-notifications)
 - [Common Operations](#common-operations)
 
@@ -166,6 +167,79 @@ python main.py --live
 
 ⚠️ **WARNING**: Live trading mode uses real money and executes actual trades on your Upstox account.
 
+## Backtesting
+
+The ZT-3 Trading System includes a powerful backtesting engine that allows you to test your strategies against historical data before risking real money.
+
+### Running a Backtest
+
+You can run a backtest using the `run_backtest.py` script:
+
+```bash
+python run_backtest.py --config default_config.yaml --start-date 2023-01-01 --end-date 2023-12-31
+```
+
+### Available Backtest Arguments
+
+| Argument        | Short | Default               | Description                                             |
+| --------------- | ----- | --------------------- | ------------------------------------------------------- |
+| `--config`      | `-c`  | `default_config.yaml` | Configuration file name within config directory         |
+| `--start-date`  | `-s`  | `2020-01-01`          | Start date for backtest in YYYY-MM-DD format            |
+| `--end-date`    | `-e`  | Current date          | End date for backtest in YYYY-MM-DD format              |
+| `--data-source` |       | `api`                 | Source of historical data: `api` or `csv`               |
+| `--csv-path`    |       | None                  | Path to CSV file(s) when data source is "csv"           |
+| `--output-dir`  | `-o`  | `results`             | Output directory for backtest results                   |
+| `--log-level`   | `-d`  | `INFO`                | Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL    |
+| `--params`      | `-p`  | None                  | JSON string with strategy parameters to override config |
+
+### Using CSV Data
+
+You can run backtests against your own CSV files:
+
+```bash
+# Using a single CSV file for all symbols
+python run_backtest.py --data-source csv --csv-path data/historical/nse_stocks.csv
+
+# Using different CSV files for different symbols
+python run_backtest.py --data-source csv --csv-path "NSE:SBIN:data/sbin.csv,NSE:PNB:data/pnb.csv"
+```
+
+The CSV files should have at least these columns: timestamp, open, high, low, close, volume.
+
+### Overriding Strategy Parameters
+
+You can override strategy parameters from the command line:
+
+```bash
+python run_backtest.py --params '{"gc_period": 120, "gc_multiplier": 1.5, "stoch_rsi_length": 10}'
+```
+
+### Backtest Results
+
+After running a backtest, the system will:
+
+1. Print a summary of results to the console
+2. Generate detailed HTML and JSON reports in the output directory
+3. Optionally send results to Discord if configured
+
+The results include:
+
+- Performance metrics (total return, annual return, Sharpe ratio)
+- Drawdown analysis
+- Trade statistics (win rate, profit factor, average trade)
+- Equity curve and other visualizations
+
+### Example Backtest Command
+
+```bash
+python run_backtest.py \
+  --config gaussian_channel_config.yaml \
+  --start-date 2022-06-01 \
+  --end-date 2023-06-01 \
+  --output-dir results/june_backtest \
+  --params '{"gc_multiplier": 1.3, "stoch_upper_band": 75.0}'
+```
+
 ## Discord Notifications
 
 The system sends real-time notifications to Discord through webhooks for different types of events.
@@ -183,6 +257,7 @@ notifications:
       performance: "${DISCORD_WEBHOOK_PERFORMANCE}"
       signals: "${DISCORD_WEBHOOK_SIGNALS}"
       system_status: "${DISCORD_WEBHOOK_SYSTEM}"
+      backtest_results: "${DISCORD_WEBHOOK_BACKTEST}" # For detailed backtest results
   notification_levels:
     trade_alerts: true
     performance: true

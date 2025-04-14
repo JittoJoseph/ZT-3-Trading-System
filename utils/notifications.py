@@ -50,13 +50,14 @@ class NotificationManager:
         else:
             # Fallback to single webhook URL for backwards compatibility
             single_webhook = discord_config.get('webhook_url', '')
-            if single_webhook:
+            if (single_webhook):
                 # Use the same URL for all notification types
                 self.webhooks = {
                     'trade_alerts': single_webhook,
                     'performance': single_webhook,
                     'signals': single_webhook,
-                    'system_status': single_webhook
+                    'system_status': single_webhook,
+                    'backtest_results': single_webhook  # Add backtest webhook to default configuration
                 }
             else:
                 logger.warning("Discord notifications are enabled but webhook URLs are not configured")
@@ -67,7 +68,8 @@ class NotificationManager:
             'trade_alerts': True,
             'performance': True,
             'signals': True,
-            'system_status': True
+            'system_status': True,
+            'backtest_results': True  # Add backtest notification level
         })
             
         logger.info(f"Notification manager initialized. Discord enabled: {self.discord_enabled}")
@@ -390,7 +392,7 @@ class NotificationManager:
                 embed["fields"] = embed.get("fields", [])
                 embed["fields"].append({
                     "name": "Worst Trade",
-                    "value": f"{worst_symbol}: -₹{abs(worst_pnl):.2f}",
+                    "value": f"{worst_symbol}: -₹{abs(worst_pnl)::.2f}",
                     "inline": True
                 })
         
@@ -399,6 +401,129 @@ class NotificationManager:
             logger.warning("Performance notification not sent: No webhook URL configured for performance")
             return False
             
+        return self._send_discord_message(webhook_url, embeds=[embed])
+    
+    def send_backtest_results(self, results: Dict[str, Any]) -> bool:
+        """
+        Send backtest results as a detailed Discord embed.
+        
+        Args:
+            results: Dictionary with backtest results data
+            
+        Returns:
+            True if notification was sent successfully, False otherwise
+        """
+        if not self.discord_enabled or not self.notification_levels.get('backtest_results', True):
+            return False
+            
+        # Extract key backtest data
+        strategy_name = results.get('strategy_name', 'Unknown Strategy')
+        symbol = results.get('symbol', 'Unknown')
+        start_date = results.get('start_date', 'Unknown')
+        end_date = results.get('end_date', 'Unknown')
+        
+        # Performance metrics
+        total_pnl = results.get('net_pnl', 0.0)
+        pnl_percent = results.get('net_pnl_percent', 0.0)
+        total_trades = results.get('total_trades', 0)
+        win_trades = results.get('win_trades', 0)
+        win_rate = results.get('win_rate', 0.0)
+        max_drawdown = results.get('max_drawdown_percent', 0.0)
+        profit_factor = results.get('profit_factor', 0.0)
+        sharpe_ratio = results.get('sharpe_ratio', 0.0)
+        
+        # Create title and color based on performance
+        title = f"📊 Backtest Results: {strategy_name} on {symbol}"
+        color = 5763719 if total_pnl >= 0 else 15158332  # Green if profitable, red if not
+        
+        # Create description with basic overview
+        description = f"**Period**: {start_date} to {end_date}\n"
+        description += f"**Net P&L**: {'+' if total_pnl >= 0 else ''}₹{total_pnl:.2f} ({pnl_percent:.2f}%)\n"
+        description += f"**Win Rate**: {win_rate:.2f}% ({win_trades}/{total_trades} trades)\n"
+        description += f"**Max Drawdown**: {max_drawdown:.2f}%"
+        
+        # Create embed structure
+        embed = {
+            "title": title,
+            "description": description,
+            "color": color,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": f"ZT-3 Backtesting System | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            },
+            "fields": [
+                {
+                    "name": "Performance Metrics",
+                    "value": (
+                        f"Profit Factor: {profit_factor:.2f}\n"
+                        f"Sharpe Ratio: {sharpe_ratio:.2f}\n"
+                        f"Total Trades: {total_trades}\n"
+                        f"Win/Loss: {win_trades}/{total_trades-win_trades}\n"
+                    ),
+                    "inline": True
+                }
+            ]
+        }
+        
+        # Add trade statistics if available
+        if 'avg_win' in results and 'avg_loss' in results:
+            avg_win = results.get('avg_win', 0.0)
+            avg_loss = results.get('avg_loss', 0.0)
+            avg_trade = results.get('avg_trade', 0.0)
+            max_win = results.get('max_win', 0.0)
+            max_loss = results.get('max_loss', 0.0)
+            
+            embed["fields"].append({
+                "name": "Trade Statistics",
+                "value": (
+                    f"Avg Win: ₹{avg_win:.2f}\n"
+                    f"Avg Loss: ₹{avg_loss:.2f}\n"
+                    f"Avg Trade: ₹{avg_trade:.2f}\n"
+                    f"Max Win: ₹{max_win:.2f}\n"
+                    f"Max Loss: ₹{max_loss:.2f}\n"
+                ),
+                "inline": True
+            })
+        
+        # Add parameter information if available
+        if 'parameters' in results:
+            params = results.get('parameters', {})
+            param_text = ""
+            for key, value in params.items():
+                param_text += f"{key}: {value}\n"
+            
+            if param_text:
+                embed["fields"].append({
+                    "name": "Strategy Parameters",
+                    "value": param_text,
+                    "inline": False
+                })
+        
+        # Add monthly returns if available
+        if 'monthly_returns' in results:
+            monthly_returns = results.get('monthly_returns', {})
+            if monthly_returns:
+                # Format monthly returns (limit to recent months to avoid too long text)
+                months = list(monthly_returns.keys())[-6:]  # Last 6 months
+                monthly_text = ""
+                for month in months:
+                    monthly_return = monthly_returns[month]
+                    sign = '+' if monthly_return >= 0 else ''
+                    monthly_text += f"{month}: {sign}{monthly_return:.2f}%\n"
+                
+                embed["fields"].append({
+                    "name": "Recent Monthly Returns",
+                    "value": monthly_text or "No monthly data",
+                    "inline": False
+                })
+        
+        # Check for dedicated backtest webhook URL
+        webhook_url = self.webhooks.get('backtest_results')
+        if not webhook_url:
+            logger.warning("Backtest results notification not sent: No webhook URL configured for backtest_results")
+            return False
+            
+        # Send the embed to Discord
         return self._send_discord_message(webhook_url, embeds=[embed])
     
     def _send_discord_message(self, webhook_url: str, content: Optional[str] = None, embeds: Optional[List[Dict[str, Any]]] = None) -> bool:
