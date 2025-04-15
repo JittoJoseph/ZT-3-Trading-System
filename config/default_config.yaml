@@ -21,19 +21,9 @@ symbols:
     tick_size: 0.05
     lot_size: 1
 
-# Strategy Configuration
+# Strategy identifier (no parameters here)
 strategy:
   name: "GaussianChannel"
-  params:
-    gc_period: 144
-    gc_multiplier: 1.2
-    stoch_rsi_length: 14
-    stoch_length: 14
-    stoch_k_smooth: 3
-    stoch_upper_band: 80.0
-    atr_length: 14
-    atr_tp_multiplier: 4.0
-    volume_ma_length: 20
 
 # Risk Management Settings
 risk:
@@ -90,3 +80,9 @@ data:
   save_trades: true
   storage_path: "data/storage"
   cache_historical_data: true
+
+# Backtesting configuration
+backtest:
+  starting_capital: 3000.0
+  commission_percent: 0.03
+  slippage_percent: 0.1

@@ -15,17 +15,25 @@ import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import itertools
 import matplotlib.pyplot as plt
+import logging
 
 # Add project root to Python path
 sys.path.insert(0, str(Path(__file__).parents[1]))
+
+# Import for loading environment variables
+from dotenv import load_dotenv
 
 # Import internal modules
 from backtest.backtester import Backtester
 from config.loader import ConfigLoader
 from utils.logger import setup_logging
+from strategy.gaussian_channel import GaussianChannelStrategy
+
+# Load environment variables
+load_dotenv()
 
 def run_parameter_optimization():
     """
@@ -42,137 +50,83 @@ def run_parameter_optimization():
     config_loader = ConfigLoader()
     base_config = config_loader.load_config('default_config.yaml')
     
-    # Parameters to test (modify these according to your requirements)
-    gc_periods = [112, 144, 176]
-    gc_multipliers = [1.0, 1.2, 1.4]
-    stoch_upper_bands = [70.0, 80.0, 90.0]
-    atr_tp_multipliers = [3.0, 4.0, 5.0]
+    # Use reasonable date range for backtesting
+    # Default to past 6 months of data
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=180)
     
-    # Generate all combinations of parameters
-    param_combinations = list(itertools.product(
-        gc_periods, gc_multipliers, stoch_upper_bands, atr_tp_multipliers
-    ))
+    # Convert to string format
+    end_date_str = end_date.strftime('%Y-%m-%d')
+    start_date_str = start_date.strftime('%Y-%m-%d')
     
-    print(f"Testing {len(param_combinations)} parameter combinations...")
+    print(f"Testing strategy on date range {start_date_str} to {end_date_str}")
     
-    # Results storage
-    results = []
-    
-    # Run backtest for each parameter combination
-    for i, (gc_period, gc_multiplier, stoch_upper_band, atr_tp_multiplier) in enumerate(param_combinations):
-        print(f"\nRunning test {i+1}/{len(param_combinations)}")
-        print(f"Parameters: GC Period={gc_period}, GC Mult={gc_multiplier}, Stoch Band={stoch_upper_band}, ATR TP={atr_tp_multiplier}")
-        
-        # Create config for this test
-        config = base_config.copy()
-        config['strategy']['params'].update({
-            'gc_period': gc_period,
-            'gc_multiplier': gc_multiplier,
-            'stoch_upper_band': stoch_upper_band,
-            'atr_tp_multiplier': atr_tp_multiplier
-        })
+    # Create a function to run a single backtest with specific parameters
+    def run_single_backtest(symbols, backtest_id=1, total_tests=1):
+        print(f"\nRunning test {backtest_id}/{total_tests}")
         
         # Initialize backtester
-        backtester = Backtester(config)
+        backtester = Backtester(base_config)
         
-        # Load data
-        try:
-            for symbol in backtester.symbols:
+        # Get the strategy instance directly
+        strategy = backtester.strategy
+        
+        # Output the current parameter values
+        print(f"Current Parameters:")
+        print(f"GC Period: {strategy.gc_period}")
+        print(f"GC Multiplier: {strategy.gc_multiplier}")
+        print(f"Stoch Upper Band: {strategy.stoch_upper_band}")
+        print(f"ATR TP Multiplier: {strategy.atr_tp_multiplier}")
+        
+        # Load data for each symbol
+        for symbol in symbols:
+            try:
                 backtester.load_data(
                     symbol=symbol,
-                    start_date='2023-01-01',
-                    end_date='2023-12-31',
-                    source='api'
+                    start_date=start_date_str,
+                    end_date=end_date_str,
+                    source='api',  # Use API to get real data
+                    interval='5minute'  # Upstox API format
                 )
-        except Exception as e:
-            print(f"Error loading data: {e}")
-            continue
-            
+                print(f"Data loaded for {symbol}")
+            except Exception as e:
+                print(f"Error loading data for {symbol}: {e}")
+                return None
+        
         # Run backtest
         metrics = backtester.run_backtest()
         
-        # Store results
-        results.append({
-            'gc_period': gc_period,
-            'gc_multiplier': gc_multiplier,
-            'stoch_upper_band': stoch_upper_band,
-            'atr_tp_multiplier': atr_tp_multiplier,
-            'total_return': metrics['total_return'],
-            'sharpe_ratio': metrics['sharpe_ratio'],
-            'win_rate': metrics['win_rate'],
-            'profit_factor': metrics['profit_factor'],
-            'max_drawdown': metrics['max_drawdown'],
-            'total_trades': metrics['total_trades']
-        })
+        # Format metrics for display
+        print(f"\nBacktest Results:")
+        print(f"Total Return: {metrics['total_return_percent']:.2f}%")
+        print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+        print(f"Win Rate: {metrics['win_rate_percent']:.2f}%")
+        print(f"Profit Factor: {metrics['profit_factor']:.2f}")
+        print(f"Max Drawdown: {metrics['max_drawdown_percent']:.2f}%")
+        print(f"Total Trades: {metrics['total_trades']}")
         
-    # Convert to DataFrame for analysis
-    results_df = pd.DataFrame(results)
+        return metrics
     
-    # Sort by various metrics
-    print("\nTop 5 by Total Return:")
-    print(results_df.sort_values('total_return', ascending=False).head(5))
+    # Run a single backtest using the default parameters
+    symbols = [f"{s['exchange']}:{s['ticker']}" for s in base_config.get('symbols', [])]
     
-    print("\nTop 5 by Sharpe Ratio:")
-    print(results_df.sort_values('sharpe_ratio', ascending=False).head(5))
+    results = run_single_backtest(symbols)
     
-    print("\nTop 5 by Profit Factor:")
-    print(results_df.sort_values('profit_factor', ascending=False).head(5))
-    
-    # Find best overall parameters (simple scoring)
-    results_df['score'] = (
-        results_df['sharpe_ratio'] / results_df['sharpe_ratio'].max() +
-        results_df['total_return'] / results_df['total_return'].max() +
-        results_df['profit_factor'] / results_df['profit_factor'].max() -
-        results_df['max_drawdown'] / results_df['max_drawdown'].max()
-    )
-    
-    print("\nTop 5 Overall (Combined Score):")
-    top_params = results_df.sort_values('score', ascending=False).head(5)
-    print(top_params)
-    
-    # Save results
-    results_dir = Path('results/parameter_optimization')
-    results_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_df.to_csv(results_dir / f"param_opt_results_{timestamp}.csv", index=False)
-    
-    print(f"\nResults saved to: {results_dir}/param_opt_results_{timestamp}.csv")
-    
-    # Optionally run a final backtest with the best parameters
-    best_params = top_params.iloc[0]
-    print("\nRunning final backtest with best parameters:")
-    print(f"GC Period: {best_params['gc_period']}")
-    print(f"GC Multiplier: {best_params['gc_multiplier']}")
-    print(f"Stoch Upper Band: {best_params['stoch_upper_band']}")
-    print(f"ATR TP Multiplier: {best_params['atr_tp_multiplier']}")
-    
-    best_config = base_config.copy()
-    best_config['strategy']['params'].update({
-        'gc_period': best_params['gc_period'],
-        'gc_multiplier': best_params['gc_multiplier'],
-        'stoch_upper_band': best_params['stoch_upper_band'],
-        'atr_tp_multiplier': best_params['atr_tp_multiplier']
-    })
-    
-    # Initialize backtester with best parameters
-    best_backtester = Backtester(best_config)
-    
-    # Load data (longer period for final backtest)
-    for symbol in best_backtester.symbols:
-        best_backtester.load_data(
-            symbol=symbol,
-            start_date='2022-01-01',
-            end_date='2023-12-31',
-            source='api'
-        )
-    
-    # Run final backtest
-    final_metrics = best_backtester.run_backtest()
-    
-    # Save final results
-    best_backtester.save_results(results_dir / "best_parameters")
-    
-    print("\nFinal backtest completed and results saved.")
+    if results:
+        # Save results
+        results_dir = Path('results/backtest')
+        results_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Convert metrics to DataFrame
+        results_df = pd.DataFrame([results])
+        results_df.to_csv(results_dir / f"backtest_results_{timestamp}.csv", index=False)
+        
+        print(f"\nResults saved to: {results_dir}/backtest_results_{timestamp}.csv")
+
+def main():
+    """Main entry point for the script."""
+    run_parameter_optimization()
 
 if __name__ == "__main__":
-    run_parameter_optimization()
+    main()

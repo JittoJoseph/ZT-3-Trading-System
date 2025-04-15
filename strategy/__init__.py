@@ -97,7 +97,8 @@ class Strategy:
     Base class for all trading strategies.
     
     Provides a standard interface for implementing trading strategies
-    and generating signals.
+    and generating signals. Strategy parameters should be hardcoded 
+    in each strategy implementation rather than taken from config.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -105,13 +106,12 @@ class Strategy:
         Initialize a strategy.
         
         Args:
-            config: Strategy configuration dictionary
+            config: System configuration dictionary (not for strategy parameters)
         """
         self.config = config
         self.name = self.__class__.__name__
-        self.params = config.get('strategy', {}).get('params', {})
         
-        # Default settings if not specified in config
+        # Default settings
         self.symbols = [s['ticker'] for s in config.get('symbols', [])]
         
         # Signal tracking to avoid duplicates
@@ -134,9 +134,22 @@ class Strategy:
         # This method should be overridden by concrete strategy classes
         raise NotImplementedError("Subclasses must implement process_candle()")
     
+    def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prepare data by calculating all necessary indicators.
+        
+        Args:
+            df: DataFrame with raw OHLCV data
+            
+        Returns:
+            DataFrame with all indicators added
+        """
+        # This method should be overridden by concrete strategy classes
+        raise NotImplementedError("Subclasses must implement prepare_data()")
+    
     def calculate_take_profit(self, entry_price: float, candle_data: pd.DataFrame) -> float:
         """
-        Calculate take profit level based on ATR.
+        Calculate take profit level.
         
         Args:
             entry_price: Entry price
@@ -145,26 +158,8 @@ class Strategy:
         Returns:
             Take profit price level
         """
-        # Default implementation using ATR
-        atr = candle_data['atr'].iloc[-1]
-        atr_multiplier = self.params.get('atr_tp_multiplier', 4.0)
-        return entry_price + (atr * atr_multiplier)
-    
-    def calculate_stop_loss(self, entry_price: float, candle_data: pd.DataFrame) -> float:
-        """
-        Calculate stop loss level.
-        
-        Args:
-            entry_price: Entry price
-            candle_data: DataFrame containing candle data with indicators
-            
-        Returns:
-            Stop loss price level
-        """
-        # Default implementation - override in subclasses as needed
-        # By default, using a percentage of entry price
-        stop_percent = self.params.get('stop_loss_percent', 1.5)
-        return entry_price * (1 - stop_percent/100)
+        # This method should be overridden by concrete strategy classes
+        raise NotImplementedError("Subclasses must implement calculate_take_profit()")
     
     def is_duplicate_signal(self, signal_type: SignalType, symbol: str, timestamp: pd.Timestamp) -> bool:
         """
@@ -194,3 +189,34 @@ class Strategy:
             self._last_exit_signals[symbol] = timestamp
         
         return False
+
+    def generate_signals(self, df: pd.DataFrame, symbol: str) -> List[Signal]:
+        """
+        Generate all trading signals for a historical dataset.
+        
+        This is primarily used for backtesting.
+        
+        Args:
+            df: DataFrame with price data (should contain OHLCV data)
+            symbol: Trading symbol
+            
+        Returns:
+            List of Signal objects
+        """
+        # This can be implemented by concrete strategy classes if needed
+        # Otherwise use this default implementation that processes each candle
+        signals = []
+        
+        # Process each candle and accumulate signals
+        for i in range(1, len(df)):
+            # Create a DataFrame with data up to the current candle
+            data_slice = df.iloc[:i+1]
+            
+            # Process the candle
+            signal = self.process_candle(data_slice, symbol)
+            
+            # Add signal to list if generated
+            if signal:
+                signals.append(signal)
+                
+        return signals

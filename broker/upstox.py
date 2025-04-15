@@ -1,175 +1,202 @@
 """
-Upstox broker implementation for ZT-3 Trading System.
+Upstox Broker Interface for ZT-3 Trading System.
 
-This module handles all interactions with the Upstox API including:
-- Authentication
-- Market data streaming
-- Order execution
-- Position management
+This module handles connection to Upstox API for placing orders,
+managing positions, and authentication.
 """
 
-import json
 import logging
-import time
-import webbrowser
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Callable, Union, Tuple
+import json
 import requests
-from urllib.parse import urlencode, parse_qs, urlparse
+import time
+from datetime import datetime, timedelta
+import os
+import webbrowser
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
 class UpstoxBroker:
     """
-    Broker implementation for Upstox API.
+    Interface for the Upstox broker API.
     
-    This class handles all interactions with the Upstox API, including
-    authentication, order execution, and market data streaming.
+    This class handles authentication, order placement, and position management.
     """
     
-    # API endpoints based on Upstox API v2 documentation
+    # API endpoints
     BASE_URL = "https://api.upstox.com/v2"
+    TOKEN_URL = f"{BASE_URL}/login/authorization/token"
     AUTH_URL = "https://api.upstox.com/v2/login/authorization/dialog"
-    TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
-    LOGOUT_URL = "https://api.upstox.com/v2/logout"
+    PROFILE_URL = f"{BASE_URL}/user/profile"
     
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the Upstox broker with configuration.
+        Initialize Upstox broker interface.
         
         Args:
-            config: Configuration dictionary with API credentials and settings.
+            config: Configuration dictionary with API credentials
         """
-        self.api_config = config['api']
-        self.api_key = self.api_config['api_key']
-        self.api_secret = self.api_config['api_secret']
-        self.redirect_uri = self.api_config.get('redirect_uri')
-        self.access_token = self.api_config.get('access_token')
+        self.config = config
+        
+        # API credentials
+        api_config = config.get('api', {})
+        self.api_key = os.environ.get('UPSTOX_API_KEY') or api_config.get('api_key')
+        self.api_secret = os.environ.get('UPSTOX_API_SECRET') or api_config.get('api_secret')
+        self.redirect_uri = api_config.get('redirect_uri', 'http://localhost:3000/callback')
+        
+        if not self.api_key or not self.api_secret:
+            logger.error("Missing API credentials. Please set UPSTOX_API_KEY and UPSTOX_API_SECRET in .env file")
+            raise ValueError("Missing API credentials")
         
         # Authentication state
+        self.access_token = os.environ.get('UPSTOX_ACCESS_TOKEN')
+        self.refresh_token = None
         self.token_expiry = None
         
-        # Session for HTTP requests
-        self.session = requests.Session()
+        # Token file storage
+        self.token_file = Path('data/upstox_token.json')
+        self.token_file.parent.mkdir(exist_ok=True, parents=True)
         
-        # Default headers
-        self.session.headers.update({
-            'Accept': 'application/json'
-        })
+        # Try to load existing token
+        self._load_tokens()
         
-        # Order tracking
-        self.active_orders = {}  # order_id -> order details
-        self.order_callbacks = {}  # order_id -> callback function
-        self.order_status_callbacks = []  # List of general status callbacks
-        
-        # Market data client - will be initialized separately
-        self.market_data_client = None
-        
-        # Load token from file if available
-        self._load_token_from_file()
-        
-        logger.info("Initialized Upstox broker interface")
-
-    def _load_token_from_file(self) -> bool:
+        logger.debug("Upstox broker interface initialized")
+    
+    def _load_tokens(self) -> bool:
         """
-        Load access token from file if available.
+        Load authentication tokens from file.
         
         Returns:
-            bool: True if token was loaded successfully
+            True if valid tokens were loaded, False otherwise
         """
-        token_path = Path(__file__).parent / 'upstox_token.json'
-        if not token_path.exists():
-            logger.debug("No token file found")
-            return False
-            
         try:
-            with open(token_path, 'r') as f:
-                token_data = json.load(f)
-                
-            # Check if token is still valid
-            expiry_time = datetime.fromtimestamp(int(token_data.get('expires_at', 0)) / 1000)
-            if expiry_time <= datetime.now():
-                logger.info("Saved token has expired")
+            if not self.token_file.exists():
+                logger.info("No token file found, need to authenticate")
                 return False
                 
+            with open(self.token_file, 'r') as f:
+                token_data = json.load(f)
+                
             self.access_token = token_data.get('access_token')
-            self.token_expiry = expiry_time
+            self.refresh_token = token_data.get('refresh_token')
             
-            logger.info(f"Loaded access token from file, valid until {expiry_time}")
-            return True
-            
+            expiry_str = token_data.get('expiry')
+            if expiry_str:
+                self.token_expiry = datetime.fromisoformat(expiry_str)
+                
+            # Check if token is expired or will expire soon
+            if self.token_expiry and self.token_expiry > datetime.now() + timedelta(minutes=10):
+                logger.info("Loaded valid authentication tokens")
+                return True
+            else:
+                logger.info("Loaded tokens are expired or will expire soon")
+                # Try to refresh the token
+                if self.refresh_token:
+                    return self._refresh_token()
+                    
+                return False
+                
         except Exception as e:
-            logger.error(f"Error loading token from file: {e}")
+            logger.error(f"Error loading tokens: {e}")
             return False
-            
-    def _save_token_to_file(self, token_data: Dict[str, Any]) -> None:
-        """
-        Save access token to file for reuse.
-        
-        Args:
-            token_data: Token data to save
-        """
-        token_path = Path(__file__).parent / 'upstox_token.json'
-        try:
-            with open(token_path, 'w') as f:
-                json.dump(token_data, f)
-            logger.debug("Token saved to file")
-        except Exception as e:
-            logger.error(f"Error saving token to file: {e}")
-            
-    def generate_auth_url(self) -> str:
-        """
-        Generate the authorization URL for OAuth2 flow.
-        
-        Returns:
-            str: Authorization URL to redirect user for authentication
-        """
-        if not self.redirect_uri:
-            raise ValueError("Redirect URI is required for OAuth2 flow")
-            
-        params = {
-            'client_id': self.api_key,
-            'redirect_uri': self.redirect_uri,
-            'response_type': 'code',
-            'state': f"zt3_{int(time.time())}"  # Add state for security
-        }
-        
-        auth_url = f"{self.AUTH_URL}?{urlencode(params)}"
-        logger.info(f"Generated authorization URL: {auth_url}")
-        return auth_url
     
-    def open_auth_url(self) -> None:
-        """
-        Open the authorization URL in default browser.
-        
-        User will need to manually authorize and copy the code from redirect URL.
-        """
-        auth_url = self.generate_auth_url()
-        logger.info("Opening authorization URL in browser")
-        webbrowser.open(auth_url)
-        
-    def exchange_code_for_token(self, auth_code: str) -> bool:
-        """
-        Exchange authorization code for access token.
-        
-        Args:
-            auth_code: Authorization code received after user approval
-            
-        Returns:
-            bool: True if token exchange was successful
-        """
-        if not self.redirect_uri:
-            raise ValueError("Redirect URI is required for OAuth2 flow")
-            
+    def _save_tokens(self) -> None:
+        """Save authentication tokens to file."""
         try:
-            # Set headers for token request
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json'
+            token_data = {
+                'access_token': self.access_token,
+                'refresh_token': self.refresh_token,
+                'expiry': self.token_expiry.isoformat() if self.token_expiry else None
             }
             
-            payload = {
+            with open(self.token_file, 'w') as f:
+                json.dump(token_data, f, indent=2)
+                
+            logger.info("Tokens saved successfully")
+            
+            # Also update the environment variable
+            os.environ['UPSTOX_ACCESS_TOKEN'] = self.access_token
+            
+        except Exception as e:
+            logger.error(f"Error saving tokens: {e}")
+    
+    def _refresh_token(self) -> bool:
+        """
+        Refresh the access token using the refresh token.
+        
+        Returns:
+            True if token was refreshed successfully, False otherwise
+        """
+        if not self.refresh_token:
+            logger.warning("No refresh token available")
+            return False
+            
+        try:
+            # Form data for refresh token request
+            form_data = {
+                'client_id': self.api_key,
+                'client_secret': self.api_secret,
+                'refresh_token': self.refresh_token,
+                'grant_type': 'refresh_token'
+            }
+            
+            # Headers according to documentation
+            headers = {
+                'accept': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            response = requests.post(self.TOKEN_URL, data=form_data, headers=headers)
+            
+            if response.status_code != 200:
+                logger.error(f"Token refresh failed with status code: {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                return False
+                
+            data = response.json()
+            
+            # Handle both the standard success format and the direct token format
+            access_token = None
+            if "status" in data and data.get("status") == "success":
+                # Standard format
+                token_data = data.get('data', {})
+                access_token = token_data.get('access_token')
+                expires_in = token_data.get('expires_in', 86400)  # Default to 24 hours
+            else:
+                # Direct token format (new API behavior)
+                access_token = data.get('access_token')
+                expires_in = 86400  # Assume 24 hours if not provided
+            
+            if access_token:
+                self.access_token = access_token
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+                logger.info("Token refreshed successfully")
+                self._save_tokens()
+                return True
+            else:
+                logger.error(f"Token refresh failed: No access token in response")
+                logger.error(f"Response: {data}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error refreshing token: {e}")
+            return False
+    
+    def authenticate_with_code(self, auth_code: str) -> bool:
+        """
+        Authenticate using the authorization code.
+        
+        Args:
+            auth_code: Authorization code from redirect URL
+            
+        Returns:
+            True if authentication was successful, False otherwise
+        """
+        try:
+            # Create form data for token exchange with exact parameters as required by Upstox API
+            form_data = {
                 'code': auth_code,
                 'client_id': self.api_key,
                 'client_secret': self.api_secret,
@@ -177,847 +204,93 @@ class UpstoxBroker:
                 'grant_type': 'authorization_code'
             }
             
-            response = requests.post(self.TOKEN_URL, headers=headers, data=payload)
-            response.raise_for_status()
+            # Headers according to documentation
+            headers = {
+                'accept': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
             
-            result = response.json()
-            if result.get('status') != 'success':
-                logger.error(f"Token exchange failed: {result}")
+            logger.info("Requesting access token")
+            response = requests.post(self.TOKEN_URL, data=form_data, headers=headers)
+            
+            if response.status_code != 200:
+                logger.error(f"Token request failed with status code: {response.status_code}")
+                logger.error(f"Response: {response.text}")
                 return False
+                
+            data = response.json()
             
-            token_data = result.get('data', {})            
-            logger.debug(f"Token response: {token_data}")
+            # Handle both the standard success format and the direct token format
+            access_token = None
+            refresh_token = None
+            expires_in = 86400  # Default to 24 hours
             
-            # Extract access token and user details
-            self.access_token = token_data.get('access_token')
-            
-            # Calculate token expiry time (Upstox tokens expire at 6:00 AM IST the next day)
-            if 'expires_in' in token_data:
-                expiry_seconds = token_data.get('expires_in', 0)
-                self.token_expiry = datetime.now() + timedelta(seconds=expiry_seconds)
+            if "status" in data and data.get("status") == "success":
+                # Standard format
+                token_data = data.get('data', {})
+                access_token = token_data.get('access_token')
+                refresh_token = token_data.get('refresh_token')
+                expires_in = token_data.get('expires_in', 86400)
             else:
-                # Default expiry at 6:00 AM IST tomorrow
-                tomorrow = datetime.now() + timedelta(days=1)
-                self.token_expiry = datetime(
-                    tomorrow.year, tomorrow.month, tomorrow.day, 6, 0, 0
-                )
+                # Direct token format (new API behavior)
+                access_token = data.get('access_token')
+                refresh_token = data.get('refresh_token')
+            
+            if access_token:
+                self.access_token = access_token
+                self.refresh_token = refresh_token
+                self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
                 
-            logger.info(f"Authentication successful, token expires at {self.token_expiry}")
-            
-            # Save token for reuse
-            self._save_token_to_file(token_data)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error exchanging code for token: {e}")
-            return False
-            
-    def handle_auth_redirect(self, redirect_url: str) -> bool:
-        """
-        Handle redirect URL from authorization flow.
-        
-        Args:
-            redirect_url: Full redirect URL with authorization code
-            
-        Returns:
-            bool: True if authorization was successful
-        """
-        try:
-            # Parse URL to extract code
-            parsed_url = urlparse(redirect_url)
-            query_params = parse_qs(parsed_url.query)
-            
-            # Extract code
-            if 'code' not in query_params:
-                logger.error("No authorization code found in redirect URL")
-                return False
-                
-            auth_code = query_params['code'][0]
-            
-            # Check state if included
-            if 'state' in query_params and 'zt3_' not in query_params['state'][0]:
-                logger.warning("State parameter doesn't match, possible CSRF attack")
-                return False
-                
-            # Exchange code for token
-            return self.exchange_code_for_token(auth_code)
-            
-        except Exception as e:
-            logger.error(f"Error handling auth redirect: {e}")
-            return False
-            
-    def logout(self) -> bool:
-        """
-        Log out and invalidate the current access token.
-        
-        Returns:
-            bool: True if logout was successful
-        """
-        if not self.access_token:
-            logger.warning("No access token to invalidate")
-            return False
-            
-        try:
-            headers = self._get_headers()
-            response = requests.post(self.LOGOUT_URL, headers=headers)
-            response.raise_for_status()
-            
-            result = response.json()
-            if result.get('status') == 'success' and result.get('data') is True:
-                logger.info("Logout successful")
-                
-                # Clear token data
-                self.access_token = None
-                self.token_expiry = None
-                
-                # Remove token file
-                token_path = Path(__file__).parent / 'upstox_token.json'
-                if token_path.exists():
-                    token_path.unlink()
-                    
+                logger.info("Authentication successful")
+                self._save_tokens()
                 return True
             else:
-                logger.error(f"Logout failed: {result}")
+                logger.error(f"Authentication failed: No access token in response")
+                logger.error(f"Response: {data}")
                 return False
                 
         except Exception as e:
-            logger.error(f"Error during logout: {e}")
+            logger.error(f"Error during authentication: {e}")
             return False
     
     def is_authenticated(self) -> bool:
         """
-        Check if we have a valid access token.
+        Check if we have a valid authentication token.
         
         Returns:
-            bool: True if authenticated with a valid token
+            True if authenticated, False otherwise
         """
         if not self.access_token:
             return False
             
-        # Check if token is expired (if we know expiry time)
-        if self.token_expiry and datetime.now() >= self.token_expiry:
+        if self.token_expiry and self.token_expiry <= datetime.now():
             logger.warning("Access token has expired")
-            return False
+            return self._refresh_token()
             
         return True
     
-    def _get_headers(self) -> Dict[str, str]:
-        """
-        Get headers for API requests including authentication.
-        
-        Returns:
-            Dict of HTTP headers.
-        
-        Raises:
-            ValueError: If not authenticated
-        """
-        if not self.is_authenticated():
-            raise ValueError("Not authenticated. Authenticate first.")
-            
-        return {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {self.access_token}'
+    def open_auth_url(self) -> None:
+        """Open the Upstox authentication URL in a web browser."""
+        # Use exact parameter names as specified in the Upstox API documentation
+        auth_params = {
+            'response_type': 'code',
+            'client_id': self.api_key,
+            'redirect_uri': self.redirect_uri
         }
         
-    def _api_request(self, 
-                    method: str, 
-                    endpoint: str, 
-                    params: Optional[Dict[str, Any]] = None,
-                    data: Optional[Dict[str, Any]] = None,
-                    headers: Optional[Dict[str, str]] = None) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Make an API request to Upstox with proper error handling.
+        # URL encode parameter values
+        params_str = '&'.join([f"{k}={urllib.parse.quote(v)}" for k, v in auth_params.items()])
+        auth_url = f"{self.AUTH_URL}?{params_str}"
         
-        Args:
-            method: HTTP method (GET, POST, PUT, DELETE)
-            endpoint: API endpoint relative to BASE_URL
-            params: URL parameters
-            data: Request body data
-            headers: Custom headers (will be merged with auth headers)
-            
-        Returns:
-            Tuple containing (success boolean, response data)
-        """
-        try:
-            # Get authentication headers
-            base_headers = self._get_headers()
-            
-            # Merge with custom headers if provided
-            if headers:
-                request_headers = {**base_headers, **headers}
-            else:
-                request_headers = base_headers
-                
-            # Format URL
-            url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
-            
-            # Make request
-            response = requests.request(
-                method=method,
-                url=url,
-                params=params,
-                json=data,
-                headers=request_headers
-            )
-            
-            # Handle 4xx/5xx errors
-            response.raise_for_status()
-            
-            # Parse response
-            result = response.json()
-            
-            # Check API status
-            if result.get('status') == 'error':
-                error_data = result.get('data', {})
-                error_code = error_data.get('code', 'unknown')
-                error_message = error_data.get('message', 'Unknown error')
-                logger.error(f"API error {error_code}: {error_message}")
-                return False, result
-                
-            return True, result
-            
-        except requests.exceptions.HTTPError as e:
-            # Handle HTTP errors
-            if e.response.status_code == 401:
-                logger.error("Authentication failed (401): Token may have expired")
-            elif e.response.status_code == 429:
-                logger.error("Rate limit exceeded (429): Too many requests")
-            logger.error(f"HTTP error: {e}")
-            
-            # Try to parse error response
-            try:
-                error_json = e.response.json()
-                error_data = error_json.get('data', {})
-                error_message = error_data.get('message', str(e))
-                logger.error(f"API error response: {error_message}")
-                return False, error_json
-            except Exception:
-                return False, {'status': 'error', 'data': {'message': str(e)}}
-                
-        except Exception as e:
-            logger.error(f"Request error: {e}")
-            return False, {'status': 'error', 'data': {'message': str(e)}}
-    
-    def get_profile(self) -> Dict[str, Any]:
-        """
-        Get user profile information.
+        logger.info(f"Opening authorization URL: {auth_url}")
+        webbrowser.open(auth_url)
         
-        Returns:
-            Dict containing user profile data.
-        """
-        success, response = self._api_request('GET', 'user/profile')
-        if success:
-            return response.get('data', {})
-        return {}
-    
-    def get_funds(self) -> Dict[str, Any]:
-        """
-        Get account fund and margin details.
+        print("\n=======================")
+        print("Upstox Authentication Required")
+        print("=======================")
+        print("A browser window has been opened for you to login to Upstox.")
+        print("After logging in, you will be redirected back to the application.")
+        print("\nIf the browser doesn't open automatically, please navigate to:")
+        print(auth_url)
         
-        Returns:
-            Dict containing fund information.
-        """
-        success, response = self._api_request('GET', 'user/funds-and-margin')
-        if success:
-            return response.get('data', {})
-        return {}
-    
-    def get_brokerage_charges(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Calculate brokerage charges for a potential order.
-        
-        Args:
-            params: Dict with order parameters including:
-                - symbol: Trading symbol with exchange prefix
-                - quantity: Number of shares
-                - product: Product type (I/D)
-                - transaction_type: BUY/SELL
-                - price: Order price
-                
-        Returns:
-            Dict with calculated brokerage details.
-        """
-        success, response = self._api_request('GET', 'brokerage', params=params)
-        if success:
-            return response.get('data', {})
-        return {}
-        
-    def get_margin_required(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Calculate margin required for an order.
-        
-        Args:
-            order_data: Dict with order details:
-                - symbol: Trading symbol with exchange prefix
-                - quantity: Number of shares
-                - product: Product type (I/D)
-                - transaction_type: BUY/SELL
-                - price: Order price
-                
-        Returns:
-            Dict with margin requirement details.
-        """
-        success, response = self._api_request('POST', 'margin-calculator', data=order_data)
-        if success:
-            return response.get('data', {})
-        return {}
-    
-    def get_instruments(self, instrument_type: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Get list of available instruments.
-        
-        Args:
-            instrument_type: Optional filter by instrument_type 
-                            (EQ, FUT, OPT, etc.)
-                            
-        Returns:
-            List of instrument details.
-        """
-        params = {}
-        if instrument_type:
-            params['instrument_type'] = instrument_type
-            
-        success, response = self._api_request('GET', 'instruments', params=params)
-        if success:
-            return response.get('data', [])
-        return []
-    
-    def get_positions(self) -> List[Dict[str, Any]]:
-        """
-        Get current positions.
-        
-        Returns:
-            List of position details.
-        """
-        success, response = self._api_request('GET', 'portfolio/positions')
-        if success:
-            return response.get('data', [])
-        return []
-    
-    def get_holdings(self) -> List[Dict[str, Any]]:
-        """
-        Get holdings information.
-        
-        Returns:
-            List of holdings details.
-        """
-        success, response = self._api_request('GET', 'portfolio/holdings')
-        if success:
-            return response.get('data', [])
-        return []
-    
-    def get_orders(self) -> List[Dict[str, Any]]:
-        """
-        Get all orders for the day.
-        
-        Returns:
-            List of order details.
-        """
-        success, response = self._api_request('GET', 'orders')
-        if success:
-            return response.get('data', [])
-        return []
-    
-    def get_trades(self) -> List[Dict[str, Any]]:
-        """
-        Get all trades for the day.
-        
-        Returns:
-            List of trade details.
-        """
-        success, response = self._api_request('GET', 'trades')
-        if success:
-            return response.get('data', [])
-        return []
-    
-    def place_order(self, 
-                  symbol: str,
-                  exchange: str,
-                  transaction_type: str,
-                  quantity: int,
-                  product: str = 'I',  # 'I' for intraday, 'D' for delivery
-                  order_type: str = 'MARKET',
-                  price: float = 0,
-                  trigger_price: float = 0,
-                  disclosed_quantity: int = 0,
-                  validity: str = 'DAY',
-                  tag: str = "ZT3") -> Dict[str, Any]:
-        """
-        Place an order with Upstox.
-        
-        Args:
-            symbol: Trading symbol
-            exchange: Exchange (NSE, BSE, etc.)
-            transaction_type: BUY or SELL
-            quantity: Number of shares
-            product: Product type (I: intraday, D: delivery)
-            order_type: MARKET, LIMIT, SL, SL-M
-            price: Order price (for LIMIT, SL orders)
-            trigger_price: Trigger price (for SL, SL-M orders)
-            disclosed_quantity: Disclosed quantity
-            validity: DAY, IOC
-            tag: Order tag for identification
-            
-        Returns:
-            Order details including order ID.
-        """
-        payload = {
-            'symbol': f"{exchange}:{symbol}",
-            'transaction_type': transaction_type,
-            'quantity': quantity,
-            'product': product,
-            'order_type': order_type,
-            'validity': validity,
-            'tag': tag
-        }
-        
-        # Add price and trigger_price if needed
-        if order_type in ('LIMIT', 'SL'):
-            payload['price'] = price
-        
-        if order_type in ('SL', 'SL-M'):
-            payload['trigger_price'] = trigger_price
-            
-        if disclosed_quantity > 0:
-            payload['disclosed_quantity'] = disclosed_quantity
-        
-        success, response = self._api_request('POST', 'order/place', data=payload)
-        if success:
-            order_data = response.get('data', {})
-            order_id = order_data.get('order_id', '')
-            
-            # Store order details for tracking
-            if order_id:
-                self.active_orders[order_id] = {
-                    'symbol': symbol,
-                    'exchange': exchange,
-                    'transaction_type': transaction_type,
-                    'quantity': quantity,
-                    'order_type': order_type,
-                    'price': price,
-                    'status': 'PLACED',
-                    'timestamp': datetime.now().isoformat()
-                }
-            
-            logger.info(f"Order placed: {transaction_type} {quantity} {symbol} @ {order_type}")
-            return order_data
-        return {}
-    
-    def modify_order(self, 
-                    order_id: str,
-                    quantity: Optional[int] = None,
-                    price: Optional[float] = None,
-                    trigger_price: Optional[float] = None,
-                    disclosed_quantity: Optional[int] = None,
-                    validity: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Modify an existing order.
-        
-        Args:
-            order_id: ID of the order to modify
-            quantity: New quantity
-            price: New price
-            trigger_price: New trigger price
-            disclosed_quantity: New disclosed quantity
-            validity: New validity
-            
-        Returns:
-            Updated order details.
-        """
-        payload = {}
-        
-        # Add only parameters that are provided
-        if quantity is not None:
-            payload['quantity'] = quantity
-        if price is not None:
-            payload['price'] = price
-        if trigger_price is not None:
-            payload['trigger_price'] = trigger_price
-        if disclosed_quantity is not None:
-            payload['disclosed_quantity'] = disclosed_quantity
-        if validity is not None:
-            payload['validity'] = validity
-        
-        success, response = self._api_request('PUT', f"order/modify/{order_id}", data=payload)
-        if success:
-            order_data = response.get('data', {})
-            
-            # Update stored order details
-            if order_id in self.active_orders:
-                if quantity is not None:
-                    self.active_orders[order_id]['quantity'] = quantity
-                if price is not None:
-                    self.active_orders[order_id]['price'] = price
-                self.active_orders[order_id]['status'] = 'MODIFIED'
-                self.active_orders[order_id]['modified_at'] = datetime.now().isoformat()
-                
-            logger.info(f"Order {order_id} modified successfully")
-            return order_data
-        return {}
-    
-    def cancel_order(self, order_id: str) -> bool:
-        """
-        Cancel an order.
-        
-        Args:
-            order_id: ID of the order to cancel
-            
-        Returns:
-            bool: True if cancellation was successful.
-        """
-        success, response = self._api_request('DELETE', f"order/cancel/{order_id}")
-        if success:
-            # Update stored order details
-            if order_id in self.active_orders:
-                self.active_orders[order_id]['status'] = 'CANCELLED'
-                self.active_orders[order_id]['cancelled_at'] = datetime.now().isoformat()
-                
-            logger.info(f"Order {order_id} cancelled successfully")
-            return True
-        return False
-
-    def get_order_status(self, order_id: str) -> Dict[str, Any]:
-        """
-        Get the current status of an order.
-        
-        Args:
-            order_id: ID of the order to check
-            
-        Returns:
-            Order details including current status.
-        """
-        success, response = self._api_request('GET', f"order/{order_id}")
-        if success:
-            order_data = response.get('data', {})
-            
-            # Update stored order details
-            if order_id in self.active_orders:
-                self.active_orders[order_id]['status'] = order_data.get('status', 'UNKNOWN')
-                self.active_orders[order_id]['last_updated'] = datetime.now().isoformat()
-                
-            return order_data
-        return {}
-    
-    def register_order_callback(self, order_id: str, callback: Callable[[Dict[str, Any]], None]) -> None:
-        """
-        Register a callback for an order status change.
-        
-        Args:
-            order_id: Order ID to track
-            callback: Function to call when order status changes
-        """
-        self.order_callbacks[order_id] = callback
-    
-    def register_status_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
-        """
-        Register a callback for all order status updates.
-        
-        Args:
-            callback: Function to call for any order status change
-        """
-        self.order_status_callbacks.append(callback)
-    
-    def unregister_status_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
-        """
-        Unregister a previously registered status callback.
-        
-        Args:
-            callback: Callback function to remove
-        """
-        if callback in self.order_status_callbacks:
-            self.order_status_callbacks.remove(callback)
-    
-    def poll_orders_status(self) -> None:
-        """
-        Poll for status updates of all active orders.
-        
-        This is a fallback for when WebSocket updates are not available.
-        """
-        # Get all orders for the day
-        all_orders = self.get_orders()
-        
-        for order in all_orders:
-            order_id = order.get('order_id')
-            status = order.get('status')
-            
-            # Check if this is an order we're tracking and if status has changed
-            if order_id in self.active_orders:
-                old_status = self.active_orders[order_id].get('status')
-                
-                if old_status != status:
-                    # Update stored status
-                    self.active_orders[order_id]['status'] = status
-                    self.active_orders[order_id]['last_updated'] = datetime.now().isoformat()
-                    
-                    # Call order-specific callback if registered
-                    if order_id in self.order_callbacks:
-                        try:
-                            self.order_callbacks[order_id](order)
-                        except Exception as e:
-                            logger.error(f"Error in order callback for {order_id}: {e}")
-                    
-                    # Call general status callbacks
-                    for callback in self.order_status_callbacks:
-                        try:
-                            callback(order)
-                        except Exception as e:
-                            logger.error(f"Error in status callback: {e}")
-    
-    def calculate_position_size(self, 
-                               symbol: str, 
-                               price: float, 
-                               capital: float, 
-                               capital_percent: float) -> int:
-        """
-        Calculate position size based on available capital.
-        
-        Args:
-            symbol: Trading symbol
-            price: Current price
-            capital: Available capital
-            capital_percent: Percentage of capital to use (e.g., 95.0)
-            
-        Returns:
-            Number of shares to trade (rounded down to integer)
-        """
-        allocation = capital * (capital_percent / 100)
-        
-        # Check if position size would exceed available capital
-        if price > allocation:
-            logger.warning(f"Price {price} for {symbol} exceeds capital allocation {allocation}")
-            return 0
-            
-        # Calculate number of shares (round down to integer)
-        shares = int(allocation / price)
-        
-        logger.debug(f"Calculated position size for {symbol}: {shares} @ {price} " 
-                   f"(allocation: ₹{allocation:.2f} of ₹{capital:.2f})")
-        return shares
-    
-    def check_market_hours(self) -> bool:
-        """
-        Check if the market is currently open.
-        
-        Returns:
-            bool: True if market is open
-        """
-        # TODO: Implement proper market hours check for Indian markets
-        # For now, a simple check based on day of week and time
-        now = datetime.now()
-        
-        # Check if it's a weekday (0=Monday, 6=Sunday)
-        if now.weekday() >= 5:  # Saturday or Sunday
-            return False
-            
-        # Check if time is between 9:15 AM and 3:30 PM IST
-        market_open = now.replace(hour=9, minute=15, second=0)
-        market_close = now.replace(hour=15, minute=30, second=0)
-        
-        return market_open <= now <= market_close
-    
-    def execute_trade_from_signal(self, signal, available_capital: float, capital_percent: float = 95.0) -> Dict[str, Any]:
-        """
-        Execute a trade based on a trading signal.
-        
-        Args:
-            signal: Trading signal object from strategy
-            available_capital: Available capital for trading
-            capital_percent: Percentage of capital to use
-            
-        Returns:
-            Dict with trade execution details
-        """
-        if not self.is_authenticated():
-            logger.error("Not authenticated with Upstox API")
-            return {'success': False, 'error': 'Not authenticated'}
-            
-        # Check if market is open
-        if not self.check_market_hours():
-            logger.warning("Market is closed, cannot execute trade")
-            return {'success': False, 'error': 'Market closed'}
-            
-        try:
-            symbol = signal.symbol
-            signal_type = signal.signal_type
-            price = signal.price
-            
-            # Extract symbol and exchange
-            if ':' in symbol:
-                exchange, symbol_name = symbol.split(':')
-            else:
-                # Default to NSE if not specified
-                exchange = 'NSE'
-                symbol_name = symbol
-            
-            if signal_type == 'ENTRY':
-                # Calculate position size
-                quantity = self.calculate_position_size(
-                    symbol=symbol_name,
-                    price=price,
-                    capital=available_capital,
-                    capital_percent=capital_percent
-                )
-                
-                if quantity <= 0:
-                    logger.warning(f"Calculated position size is zero for {symbol}")
-                    return {'success': False, 'error': 'Insufficient capital for trade'}
-                
-                # Place buy order
-                order_result = self.place_order(
-                    symbol=symbol_name,
-                    exchange=exchange,
-                    transaction_type='BUY',
-                    quantity=quantity,
-                    product='I',  # Intraday
-                    order_type='LIMIT',  # Use LIMIT for more predictable fills
-                    price=price * 1.002,  # Slightly higher than current price to ensure fill
-                    tag='ZT3_ENTRY'
-                )
-                
-                if not order_result:
-                    return {'success': False, 'error': 'Order placement failed'}
-                
-                order_id = order_result.get('order_id', '')
-                return {
-                    'success': True,
-                    'order_id': order_id,
-                    'symbol': symbol,
-                    'quantity': quantity,
-                    'price': price,
-                    'transaction_type': 'BUY',
-                    'signal_type': 'ENTRY'
-                }
-                
-            elif signal_type == 'EXIT':
-                # Get current position for this symbol
-                positions = self.get_positions()
-                position = next((p for p in positions if p.get('symbol') == f"{exchange}:{symbol_name}"), None)
-                
-                if not position:
-                    logger.warning(f"No open position found for {symbol}")
-                    return {'success': False, 'error': 'No position to exit'}
-                
-                quantity = position.get('quantity', 0)
-                
-                if quantity <= 0:
-                    logger.warning(f"Position for {symbol} has zero quantity")
-                    return {'success': False, 'error': 'Zero quantity position'}
-                
-                # Place sell order
-                order_result = self.place_order(
-                    symbol=symbol_name,
-                    exchange=exchange,
-                    transaction_type='SELL',
-                    quantity=quantity,
-                    product='I',  # Intraday
-                    order_type='LIMIT',  # Use LIMIT for more predictable fills
-                    price=price * 0.998,  # Slightly lower to ensure fill
-                    tag='ZT3_EXIT'
-                )
-                
-                if not order_result:
-                    return {'success': False, 'error': 'Order placement failed'}
-                
-                order_id = order_result.get('order_id', '')
-                exit_reason = signal.exit_reason.value if hasattr(signal, 'exit_reason') and signal.exit_reason else 'UNKNOWN'
-                
-                return {
-                    'success': True,
-                    'order_id': order_id,
-                    'symbol': symbol,
-                    'quantity': quantity,
-                    'price': price,
-                    'transaction_type': 'SELL',
-                    'signal_type': 'EXIT',
-                    'exit_reason': exit_reason
-                }
-            else:
-                return {'success': False, 'error': f'Unknown signal type: {signal_type}'}
-                
-        except Exception as e:
-            logger.error(f"Error executing trade from signal: {e}")
-            return {'success': False, 'error': str(e)}
-
-    def close_all_positions(self) -> List[Dict[str, Any]]:
-        """
-        Close all open positions.
-        
-        Returns:
-            List of order results from closing positions
-        """
-        if not self.is_authenticated():
-            logger.error("Not authenticated with Upstox API")
-            return []
-            
-        # Get all open positions
-        positions = self.get_positions()
-        if not positions:
-            logger.info("No open positions to close")
-            return []
-            
-        results = []
-        
-        for position in positions:
-            symbol = position.get('symbol', '')
-            quantity = position.get('quantity', 0)
-            
-            if not symbol or quantity <= 0:
-                continue
-                
-            # Extract exchange and symbol
-            if ':' in symbol:
-                exchange, symbol_name = symbol.split(':')
-            else:
-                continue  # Skip if can't determine exchange
-                
-            # Place sell order to close position
-            try:
-                order_result = self.place_order(
-                    symbol=symbol_name,
-                    exchange=exchange,
-                    transaction_type='SELL',
-                    quantity=quantity,
-                    product='I',  # Intraday
-                    order_type='MARKET',  # Use MARKET to ensure immediate execution
-                    tag='ZT3_EOD_CLOSE'
-                )
-                
-                if order_result:
-                    results.append({
-                        'success': True,
-                        'symbol': symbol,
-                        'quantity': quantity,
-                        'order_id': order_result.get('order_id', ''),
-                        'message': 'Position closed'
-                    })
-                    logger.info(f"Closed position for {symbol}: {quantity} shares")
-                else:
-                    results.append({
-                        'success': False,
-                        'symbol': symbol,
-                        'quantity': quantity,
-                        'message': 'Failed to close position'
-                    })
-                    logger.error(f"Failed to close position for {symbol}")
-                    
-            except Exception as e:
-                logger.error(f"Error closing position for {symbol}: {e}")
-                results.append({
-                    'success': False,
-                    'symbol': symbol,
-                    'quantity': quantity,
-                    'message': f'Error: {str(e)}'
-                })
-                
-        return results
-        
-    def set_market_data_client(self, client) -> None:
-        """
-        Set the market data client for this broker.
-        
-        Args:
-            client: MarketDataClient instance
-        """
-        self.market_data_client = client
+    # Additional broker methods would go here (order placement, position management, etc.)

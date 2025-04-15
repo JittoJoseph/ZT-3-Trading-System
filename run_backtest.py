@@ -53,14 +53,14 @@ def parse_arguments():
     # Date range
     parser.add_argument(
         '--start-date', '-s',
-        default=None,
-        help='Start date for backtest (YYYY-MM-DD)'
+        default=(datetime.now().replace(day=1) - pd.DateOffset(months=6)).strftime('%Y-%m-%d'),
+        help='Start date for backtest (YYYY-MM-DD), default: 6 months ago'
     )
     
     parser.add_argument(
         '--end-date', '-e',
-        default=None,
-        help='End date for backtest (YYYY-MM-DD)'
+        default=datetime.now().strftime('%Y-%m-%d'),
+        help='End date for backtest (YYYY-MM-DD), default: today'
     )
     
     # Data source
@@ -91,11 +91,12 @@ def parse_arguments():
         help='Logging level'
     )
     
-    # Strategy parameters override
+    # Interval
     parser.add_argument(
-        '--params', '-p',
-        default=None,
-        help='JSON string with strategy parameters to override config'
+        '--interval',
+        choices=['1minute', '5minute', '30minute', 'day', 'week', 'month'],
+        default='5minute', 
+        help='Candle interval for backtesting'
     )
     
     return parser.parse_args()
@@ -122,23 +123,22 @@ def main():
             logger.error(f"Failed to load configuration from {args.config}")
             return 1
         
-        # Override strategy parameters if provided
-        if args.params:
-            try:
-                params = json.loads(args.params)
-                if not isinstance(params, dict):
-                    raise ValueError("Parameters must be provided as a JSON object")
-                config['strategy']['params'].update(params)
-                logger.info(f"Strategy parameters overridden: {params}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in parameters: {e}")
-                return 1
-            except Exception as e:
-                logger.error(f"Failed to apply parameters: {e}")
-                return 1
-        
         # Initialize backtester
         backtester = Backtester(config)
+        
+        # Ensure we have an access token
+        if not backtester.access_token and args.data_source == 'api':
+            logger.error("No Upstox API access token available. Please run utils/get_token.py first.")
+            print("\nERROR: No Upstox API access token available.")
+            print("Please run 'python utils/get_token.py' first to authenticate with Upstox.")
+            
+            if backtester.notification_manager:
+                backtester.notification_manager.send_system_notification(
+                    "Backtest Failed", 
+                    "No Upstox API access token available. Please run utils/get_token.py first.", 
+                    "error"
+                )
+            return 1
         
         # Load historical data for each symbol
         csv_paths = {}
@@ -153,20 +153,36 @@ def main():
                 for symbol in backtester.symbols:
                     csv_paths[symbol] = args.csv_path
         
+        logger.info(f"Using {args.data_source} as data source with {args.interval} interval")
+        logger.info(f"Date range: {args.start_date} to {args.end_date}")
+        
+        # Setup notification for backtest start
+        if backtester.notification_manager:
+            try:
+                backtester.notification_manager.send_system_notification(
+                    "Backtest Started",
+                    f"Starting backtest for {', '.join(backtester.symbols)} from {args.start_date} to {args.end_date}",
+                    "info"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send start notification: {e}")
+        
+        # Load data for each symbol
         for symbol in backtester.symbols:
             csv_path = csv_paths.get(symbol) if args.data_source == 'csv' else None
             try:
                 backtester.load_data(
                     symbol=symbol,
-                    start_date=args.start_date or '2020-01-01',
-                    end_date=args.end_date or datetime.now().strftime('%Y-%m-%d'),
+                    start_date=args.start_date,
+                    end_date=args.end_date,
                     source=args.data_source,
-                    interval=config.get('strategy', {}).get('params', {}).get('interval', '5min'),
+                    interval=args.interval,
                     csv_path=csv_path
                 )
                 logger.info(f"Loaded data for {symbol}")
-            except Exception as e:
+            except ValueError as e:
                 logger.error(f"Failed to load data for {symbol}: {e}")
+                print(f"\nERROR: {str(e)}")
                 return 1
         
         # Run backtest
@@ -196,46 +212,42 @@ def main():
         print(f"Report: {results['report']}")
         
         # Send results to Discord if webhook is configured
-        try:
-            # Setup notifications with environment variables
-            notifications_config = {
-                'notifications': {
-                    'discord': {
-                        'enabled': True,
-                        'webhooks': {
-                            'backtest_results': os.environ.get('DISCORD_WEBHOOK_BACKTEST')
-                        }
-                    },
-                    'notification_levels': {
-                        'backtest_results': True
-                    }
-                }
-            }
-            
-            # Initialize NotificationManager with config
-            notifier = NotificationManager(notifications_config)
-            
-            # Add strategy name and symbol to metrics for the notification
-            metrics['strategy_name'] = config.get('strategy', {}).get('name', 'ZT-3 Strategy')
-            metrics['symbol'] = ', '.join(backtester.symbols)
-            
-            # Send notification
-            if notifier.send_backtest_results(metrics):
-                logger.info("Backtest results sent to Discord successfully")
-                print("Backtest results sent to Discord webhook")
-            else:
-                logger.warning("Failed to send backtest results to Discord")
-        except Exception as e:
-            logger.warning(f"Error sending Discord notification: {e}")
+        if backtester.notification_manager:
+            try:
+                # Add strategy name and symbol to metrics for the notification
+                metrics['strategy_name'] = config.get('strategy', {}).get('name', 'ZT-3 Strategy')
+                metrics['symbol'] = ', '.join(backtester.symbols)
+                
+                # Send notification
+                if backtester.notification_manager.send_backtest_results(metrics):
+                    logger.info("Backtest results sent to Discord successfully")
+                    print("Backtest results sent to Discord webhook")
+                else:
+                    logger.warning("Failed to send backtest results to Discord")
+            except Exception as e:
+                logger.warning(f"Error sending Discord notification: {e}")
         
         return 0
     
     except KeyboardInterrupt:
         logger.info("Backtest interrupted by user.")
-        return 0
+        return 130  # Standard exit code for SIGINT
         
     except Exception as e:
         logger.error(f"Error in backtest: {e}", exc_info=True)
+        
+        # Try to send error notification
+        try:
+            if 'backtester' in locals() and backtester.notification_manager:
+                backtester.notification_manager.send_system_notification(
+                    "Backtest Error",
+                    f"An error occurred during backtesting: {str(e)}",
+                    "error"
+                )
+        except Exception:
+            pass  # Suppress notification errors
+            
+        print(f"\nERROR: {str(e)}")
         return 1
         
 if __name__ == "__main__":

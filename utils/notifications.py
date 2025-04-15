@@ -1,281 +1,59 @@
 """
-Notifications Module for ZT-3 Trading System.
+Notification utilities for ZT-3 Trading System.
 
-This module provides functionality for sending notifications
-to Discord and other platforms about trading signals and system events.
+This module provides notification functionality including Discord webhooks
+for various types of notifications.
 """
 
 import logging
+import os
 import json
 import requests
+import time
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Union
-import traceback
+from typing import Dict, Any, Optional, List, Union
 
-from strategy import Signal
+from strategy import Signal, SignalType
 
 logger = logging.getLogger(__name__)
 
 class NotificationManager:
     """
-    Notification manager for sending alerts to various channels.
+    Handles notifications for the ZT-3 Trading System.
     
-    Supports Discord and can be extended to support other platforms.
+    This includes Discord webhook notifications for various events
+    like trade alerts, system status, errors, etc.
     """
     
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the notification manager.
+        Initialize notification manager with config.
         
         Args:
-            config: Configuration dictionary containing notification settings
+            config: Configuration dictionary with notification settings
         """
         self.config = config
-        self.notifications_config = config.get('notifications', {})
+        notif_config = config.get('notifications', {})
         
-        # Discord configuration - updated to support multiple webhooks
-        self.discord_enabled = self.notifications_config.get('discord', {}).get('enabled', False)
+        # Check if Discord notifications are enabled
+        self.enabled = notif_config.get('discord', {}).get('enabled', False)
         
-        # Get webhook URLs for different notification types
+        # Get webhook URLs from config or environment variables
         self.webhooks = {}
-        discord_config = self.notifications_config.get('discord', {})
+        discord_config = notif_config.get('discord', {}).get('webhooks', {})
         
-        if self.discord_enabled and 'webhooks' in discord_config:
-            self.webhooks = discord_config.get('webhooks', {})
-            
-            # Check if we have at least one valid webhook
-            if not any(self.webhooks.values()):
-                logger.warning("Discord notifications are enabled but no webhook URLs are configured")
-                self.discord_enabled = False
-        else:
-            # Fallback to single webhook URL for backwards compatibility
-            single_webhook = discord_config.get('webhook_url', '')
-            if (single_webhook):
-                # Use the same URL for all notification types
-                self.webhooks = {
-                    'trade_alerts': single_webhook,
-                    'performance': single_webhook,
-                    'signals': single_webhook,
-                    'system_status': single_webhook,
-                    'backtest_results': single_webhook  # Add backtest webhook to default configuration
-                }
-            else:
-                logger.warning("Discord notifications are enabled but webhook URLs are not configured")
-                self.discord_enabled = False
+        # Try to get webhooks from config first, then from environment variables
+        webhook_types = ['trade_alerts', 'performance', 'signals', 'system_status', 'backtest_results']
+        for webhook_type in webhook_types:
+            webhook_url = discord_config.get(webhook_type) or os.environ.get(f"DISCORD_WEBHOOK_{webhook_type.upper()}")
+            if webhook_url:
+                self.webhooks[webhook_type] = webhook_url
         
         # Get notification levels
-        self.notification_levels = self.notifications_config.get('notification_levels', {
-            'trade_alerts': True,
-            'performance': True,
-            'signals': True,
-            'system_status': True,
-            'backtest_results': True  # Add backtest notification level
-        })
-            
-        logger.info(f"Notification manager initialized. Discord enabled: {self.discord_enabled}")
-        if self.discord_enabled:
-            configured_channels = [k for k, v in self.webhooks.items() if v]
-            logger.info(f"Configured Discord channels: {', '.join(configured_channels)}")
-    
-    def send_signal_notification(self, signal: Signal) -> bool:
-        """
-        Send a notification about a trading signal.
+        self.notification_levels = notif_config.get('notification_levels', {})
         
-        Args:
-            signal: The trading signal to send notification about
-            
-        Returns:
-            True if notification was sent successfully, False otherwise
-        """
-        if not self.discord_enabled or not self.notification_levels.get('signals', True):
-            return False
-            
-        # Create signal message
-        signal_type = signal.signal_type.value
-        symbol = signal.symbol
-        price = signal.price
+        logger.debug(f"NotificationManager initialized with {len(self.webhooks)} webhooks")
         
-        if signal_type == "ENTRY":
-            title = f"🔵 ENTRY SIGNAL: {symbol}"
-            color = 3447003  # Discord Blue
-            description = f"Entry signal generated for {symbol} at price ₹{price:.2f}"
-            
-            # Add take profit and stop loss if available
-            if signal.take_profit_level:
-                description += f"\nTake Profit: ₹{signal.take_profit_level:.2f}"
-            if signal.stop_loss_level:
-                description += f"\nStop Loss: ₹{signal.stop_loss_level:.2f}"
-                
-        else:  # EXIT
-            title = f"🔴 EXIT SIGNAL: {symbol}"
-            color = 15158332  # Discord Red
-            description = f"Exit signal generated for {symbol} at price ₹{price:.2f}"
-            
-            # Add exit reason if available
-            if signal.exit_reason:
-                description += f"\nExit Reason: {signal.exit_reason.value}"
-        
-        # Create and send Discord embed
-        embed = {
-            "title": title,
-            "description": description,
-            "color": color,
-            "timestamp": datetime.utcnow().isoformat(),
-            "footer": {
-                "text": "ZT-3 Trading System"
-            },
-            "fields": [
-                {
-                    "name": "Symbol",
-                    "value": symbol,
-                    "inline": True
-                },
-                {
-                    "name": "Price",
-                    "value": f"₹{price:.2f}",
-                    "inline": True
-                },
-                {
-                    "name": "Time",
-                    "value": signal.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                    "inline": True
-                }
-            ]
-        }
-        
-        webhook_url = self.webhooks.get('signals')
-        if not webhook_url:
-            logger.warning("Signal notification not sent: No webhook URL configured for signals")
-            return False
-            
-        return self._send_discord_message(webhook_url, embeds=[embed])
-    
-    def send_trade_execution_notification(self, trade_details: Dict[str, Any]) -> bool:
-        """
-        Send a notification about a trade execution.
-        
-        Args:
-            trade_details: Dictionary with trade execution details
-            
-        Returns:
-            True if notification was sent successfully, False otherwise
-        """
-        if not self.discord_enabled or not self.notification_levels.get('trade_alerts', True):
-            return False
-        
-        # Extract trade details
-        symbol = trade_details.get('symbol', 'Unknown')
-        action = trade_details.get('action', 'Unknown')
-        price = float(trade_details.get('price', 0.0))
-        quantity = int(trade_details.get('quantity', 0))
-        
-        if action == "BUY":
-            title = f"🟢 BUY EXECUTED: {symbol}"
-            color = 5763719  # Green
-            description = f"Buy order executed for {quantity} shares of {symbol} at price ₹{price:.2f}"
-            
-        else:  # SELL
-            title = f"🟣 SELL EXECUTED: {symbol}"
-            color = 15105570  # Purple
-            description = f"Sell order executed for {quantity} shares of {symbol} at price ₹{price:.2f}"
-            
-            # Add P&L if available
-            if 'pnl' in trade_details:
-                pnl = float(trade_details['pnl'])
-                pnl_str = f"+₹{pnl:.2f}" if pnl >= 0 else f"-₹{abs(pnl):.2f}"
-                description += f"\nP&L: {pnl_str}"
-                
-            # Add exit reason if available
-            if 'exit_reason' in trade_details:
-                description += f"\nExit Reason: {trade_details['exit_reason']}"
-        
-        # Create and send Discord embed
-        embed = {
-            "title": title,
-            "description": description,
-            "color": color,
-            "timestamp": datetime.utcnow().isoformat(),
-            "footer": {
-                "text": "ZT-3 Trading System"
-            },
-            "fields": [
-                {
-                    "name": "Symbol",
-                    "value": symbol,
-                    "inline": True
-                },
-                {
-                    "name": "Price",
-                    "value": f"₹{price:.2f}",
-                    "inline": True
-                },
-                {
-                    "name": "Quantity",
-                    "value": str(quantity),
-                    "inline": True
-                }
-            ]
-        }
-        
-        # Add commission information if available
-        if 'commission' in trade_details:
-            embed["fields"].append({
-                "name": "Commission",
-                "value": f"₹{float(trade_details['commission']):.2f}",
-                "inline": True
-            })
-        
-        webhook_url = self.webhooks.get('trade_alerts')
-        if not webhook_url:
-            logger.warning("Trade notification not sent: No webhook URL configured for trade alerts")
-            return False
-            
-        return self._send_discord_message(webhook_url, embeds=[embed])
-    
-    def send_error_notification(self, error_message: str, error_details: Optional[str] = None) -> bool:
-        """
-        Send a notification about an error.
-        
-        Args:
-            error_message: Main error message
-            error_details: Optional additional details
-            
-        Returns:
-            True if notification was sent successfully, False otherwise
-        """
-        if not self.discord_enabled or not self.notification_levels.get('system_status', True):
-            return False
-            
-        title = "⚠️ SYSTEM ERROR"
-        description = error_message
-        
-        # Create and send Discord embed
-        embed = {
-            "title": title,
-            "description": description,
-            "color": 16711680,  # Red
-            "timestamp": datetime.utcnow().isoformat(),
-            "footer": {
-                "text": "ZT-3 Trading System"
-            }
-        }
-        
-        # Add error details if available
-        if error_details:
-            embed["fields"] = [
-                {
-                    "name": "Error Details",
-                    "value": error_details[:1000] + "..." if len(error_details) > 1000 else error_details,
-                }
-            ]
-        
-        webhook_url = self.webhooks.get('system_status')
-        if not webhook_url:
-            logger.warning("Error notification not sent: No webhook URL configured for system status")
-            return False
-            
-        return self._send_discord_message(webhook_url, embeds=[embed])
-    
     def send_system_notification(self, title: str, message: str, level: str = "info") -> bool:
         """
         Send a system notification.
@@ -283,285 +61,282 @@ class NotificationManager:
         Args:
             title: Notification title
             message: Notification message
-            level: Notification level (info, warning, error)
+            level: Notification level (info, warning, error, success)
             
         Returns:
-            True if notification was sent successfully, False otherwise
+            True if notification was sent, False otherwise
         """
-        if not self.discord_enabled or not self.notification_levels.get('system_status', True):
+        if not self.enabled or not self.notification_levels.get('system_status', True):
+            logger.debug(f"System notifications disabled, would send: {title} - {message}")
             return False
             
-        # Set color based on level
-        if level.lower() == "warning":
-            color = 16763904  # Yellow
-            title = f"⚠️ {title}"
-        elif level.lower() == "error":
-            color = 16711680  # Red
-            title = f"🚨 {title}"
-        else:  # Info
-            color = 3447003  # Blue
-            title = f"ℹ️ {title}"
-        
-        # Create and send Discord embed
-        embed = {
-            "title": title,
-            "description": message,
-            "color": color,
-            "timestamp": datetime.utcnow().isoformat(),
-            "footer": {
-                "text": "ZT-3 Trading System"
-            }
-        }
-        
         webhook_url = self.webhooks.get('system_status')
         if not webhook_url:
-            logger.warning("System notification not sent: No webhook URL configured for system status")
+            logger.warning("No system_status webhook URL configured")
             return False
-            
-        return self._send_discord_message(webhook_url, embeds=[embed])
-    
-    def send_daily_summary(self, summary: Dict[str, Any]) -> bool:
-        """
-        Send a daily trading summary.
         
-        Args:
-            summary: Dictionary with daily summary data
-            
-        Returns:
-            True if notification was sent successfully, False otherwise
-        """
-        if not self.discord_enabled or not self.notification_levels.get('performance', True):
-            return False
-            
-        # Extract summary data
-        date = summary.get('date', datetime.now().strftime("%Y-%m-%d"))
-        pnl = summary.get('daily_pnl', 0.0)
-        total_trades = summary.get('total_trades', 0)
-        win_trades = summary.get('win_trades', 0)
-        loss_trades = summary.get('loss_trades', 0)
+        # Set up the message
+        color = {
+            "info": 0x3498db,     # Blue
+            "warning": 0xe67e22,  # Orange
+            "error": 0xe74c3c,    # Red
+            "success": 0x2ecc71   # Green
+        }.get(level, 0x95a5a6)    # Default: Grey
         
-        # Calculate win rate
-        win_rate = 0.0
-        if total_trades > 0:
-            win_rate = (win_trades / total_trades) * 100
-            
-        # Create title and description
-        title = f"📊 Daily Summary: {date}"
+        # Create emoji prefix based on level
+        emoji_prefix = {
+            "info": "ℹ️",
+            "warning": "⚠️",
+            "error": "❌",
+            "success": "✅"
+        }.get(level, "🔔")
         
-        # Format P&L with color indicator
-        if pnl >= 0:
-            pnl_str = f"📈 +₹{pnl:.2f}"
-        else:
-            pnl_str = f"📉 -₹{abs(pnl):.2f}"
-            
-        description = f"**Daily P&L: {pnl_str}**\n\n"
-        description += f"Total Trades: {total_trades}\n"
-        description += f"Win Rate: {win_rate:.1f}% ({win_trades}W / {loss_trades}L)"
-        
-        # Create and send Discord embed
+        # Create rich embed for Discord
         embed = {
-            "title": title,
-            "description": description,
-            "color": 7506394 if pnl >= 0 else 16711680,  # Green if profitable, red if not
-            "timestamp": datetime.utcnow().isoformat(),
+            "title": f"{emoji_prefix} {title}",
+            "description": message,
+            "color": color,
+            "timestamp": datetime.now().isoformat(),
             "footer": {
                 "text": "ZT-3 Trading System"
             }
         }
         
-        # Add best and worst trades if available
-        if 'best_trade' in summary and 'symbol' in summary['best_trade']:
-            best_trade = summary['best_trade']
-            best_symbol = best_trade.get('symbol', '')
-            best_pnl = best_trade.get('pnl', 0.0)
-            
-            if best_symbol and best_pnl > 0:
-                embed["fields"] = embed.get("fields", [])
-                embed["fields"].append({
-                    "name": "Best Trade",
-                    "value": f"{best_symbol}: +₹{best_pnl:.2f}",
-                    "inline": True
-                })
-                
-        if 'worst_trade' in summary and 'symbol' in summary['worst_trade']:
-            worst_trade = summary['worst_trade']
-            worst_symbol = worst_trade.get('symbol', '')
-            worst_pnl = worst_trade.get('pnl', 0.0)
-            
-            if worst_symbol and worst_pnl < 0:
-                embed["fields"] = embed.get("fields", [])
-                embed["fields"].append({
-                    "name": "Worst Trade",
-                    "value": f"{worst_symbol}: -₹{abs(worst_pnl)::.2f}",
-                    "inline": True
-                })
+        payload = {
+            "embeds": [embed]
+        }
         
-        webhook_url = self.webhooks.get('performance')
-        if not webhook_url:
-            logger.warning("Performance notification not sent: No webhook URL configured for performance")
+        try:
+            response = requests.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send system notification: {e}")
             return False
-            
-        return self._send_discord_message(webhook_url, embeds=[embed])
     
-    def send_backtest_results(self, results: Dict[str, Any]) -> bool:
+    def send_signal_notification(self, signal: Signal) -> bool:
         """
-        Send backtest results as a detailed Discord embed.
+        Send a signal notification.
         
         Args:
-            results: Dictionary with backtest results data
+            signal: Signal object from strategy
             
         Returns:
-            True if notification was sent successfully, False otherwise
+            True if notification was sent, False otherwise
         """
-        if not self.discord_enabled or not self.notification_levels.get('backtest_results', True):
+        if not self.enabled or not self.notification_levels.get('signals', True):
             return False
             
-        # Extract key backtest data
-        strategy_name = results.get('strategy_name', 'Unknown Strategy')
-        symbol = results.get('symbol', 'Unknown')
-        start_date = results.get('start_date', 'Unknown')
-        end_date = results.get('end_date', 'Unknown')
+        webhook_url = self.webhooks.get('signals')
+        if not webhook_url:
+            logger.warning("No signals webhook URL configured")
+            return False
         
-        # Performance metrics
-        total_pnl = results.get('net_pnl', 0.0)
-        pnl_percent = results.get('net_pnl_percent', 0.0)
-        total_trades = results.get('total_trades', 0)
-        win_trades = results.get('win_trades', 0)
-        win_rate = results.get('win_rate', 0.0)
-        max_drawdown = results.get('max_drawdown_percent', 0.0)
-        profit_factor = results.get('profit_factor', 0.0)
-        sharpe_ratio = results.get('sharpe_ratio', 0.0)
+        # Determine color based on signal type
+        color = 0x2ecc71 if signal.signal_type == SignalType.ENTRY else 0xe74c3c  # Green for entry, red for exit
         
-        # Create title and color based on performance
-        title = f"📊 Backtest Results: {strategy_name} on {symbol}"
-        color = 5763719 if total_pnl >= 0 else 15158332  # Green if profitable, red if not
+        # Format the message
+        title = f"{'🟢 Entry' if signal.signal_type == SignalType.ENTRY else '🔴 Exit'} Signal - {signal.symbol}"
         
-        # Create description with basic overview
-        description = f"**Period**: {start_date} to {end_date}\n"
-        description += f"**Net P&L**: {'+' if total_pnl >= 0 else ''}₹{total_pnl:.2f} ({pnl_percent:.2f}%)\n"
-        description += f"**Win Rate**: {win_rate:.2f}% ({win_trades}/{total_trades} trades)\n"
-        description += f"**Max Drawdown**: {max_drawdown:.2f}%"
+        description = f"**Price:** ₹{signal.price:.2f}\n"
+        description += f"**Time:** {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
         
-        # Create embed structure
+        if signal.signal_type == SignalType.ENTRY:
+            if signal.take_profit_level:
+                description += f"**Take Profit:** ₹{signal.take_profit_level:.2f}\n"
+            if signal.stop_loss_level:
+                description += f"**Stop Loss:** ₹{signal.stop_loss_level:.2f}\n"
+        elif signal.signal_type == SignalType.EXIT and signal.exit_reason:
+            description += f"**Exit Reason:** {signal.exit_reason.value}\n"
+        
+        # Create embed
         embed = {
             "title": title,
             "description": description,
             "color": color,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "footer": {
-                "text": f"ZT-3 Backtesting System | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            },
-            "fields": [
-                {
-                    "name": "Performance Metrics",
-                    "value": (
-                        f"Profit Factor: {profit_factor:.2f}\n"
-                        f"Sharpe Ratio: {sharpe_ratio:.2f}\n"
-                        f"Total Trades: {total_trades}\n"
-                        f"Win/Loss: {win_trades}/{total_trades-win_trades}\n"
-                    ),
-                    "inline": True
-                }
-            ]
+                "text": "ZT-3 Trading System"
+            }
         }
         
-        # Add trade statistics if available
-        if 'avg_win' in results and 'avg_loss' in results:
-            avg_win = results.get('avg_win', 0.0)
-            avg_loss = results.get('avg_loss', 0.0)
-            avg_trade = results.get('avg_trade', 0.0)
-            max_win = results.get('max_win', 0.0)
-            max_loss = results.get('max_loss', 0.0)
-            
-            embed["fields"].append({
-                "name": "Trade Statistics",
-                "value": (
-                    f"Avg Win: ₹{avg_win:.2f}\n"
-                    f"Avg Loss: ₹{avg_loss:.2f}\n"
-                    f"Avg Trade: ₹{avg_trade:.2f}\n"
-                    f"Max Win: ₹{max_win:.2f}\n"
-                    f"Max Loss: ₹{max_loss:.2f}\n"
-                ),
-                "inline": True
-            })
+        payload = {
+            "embeds": [embed]
+        }
         
-        # Add parameter information if available
-        if 'parameters' in results:
-            params = results.get('parameters', {})
-            param_text = ""
-            for key, value in params.items():
-                param_text += f"{key}: {value}\n"
-            
-            if param_text:
-                embed["fields"].append({
-                    "name": "Strategy Parameters",
-                    "value": param_text,
-                    "inline": False
-                })
-        
-        # Add monthly returns if available
-        if 'monthly_returns' in results:
-            monthly_returns = results.get('monthly_returns', {})
-            if monthly_returns:
-                # Format monthly returns (limit to recent months to avoid too long text)
-                months = list(monthly_returns.keys())[-6:]  # Last 6 months
-                monthly_text = ""
-                for month in months:
-                    monthly_return = monthly_returns[month]
-                    sign = '+' if monthly_return >= 0 else ''
-                    monthly_text += f"{month}: {sign}{monthly_return:.2f}%\n"
-                
-                embed["fields"].append({
-                    "name": "Recent Monthly Returns",
-                    "value": monthly_text or "No monthly data",
-                    "inline": False
-                })
-        
-        # Check for dedicated backtest webhook URL
-        webhook_url = self.webhooks.get('backtest_results')
-        if not webhook_url:
-            logger.warning("Backtest results notification not sent: No webhook URL configured for backtest_results")
-            return False
-            
-        # Send the embed to Discord
-        return self._send_discord_message(webhook_url, embeds=[embed])
-    
-    def _send_discord_message(self, webhook_url: str, content: Optional[str] = None, embeds: Optional[List[Dict[str, Any]]] = None) -> bool:
-        """
-        Send a message to Discord using webhook.
-        
-        Args:
-            webhook_url: Discord webhook URL
-            content: Text content of the message
-            embeds: List of Discord embeds
-            
-        Returns:
-            True if message was sent successfully, False otherwise
-        """
-        if not self.discord_enabled or not webhook_url:
-            return False
-            
-        payload = {}
-        
-        if content:
-            payload["content"] = content
-            
-        if embeds:
-            payload["embeds"] = embeds
-            
         try:
-            headers = {"Content-Type": "application/json"}
             response = requests.post(
-                webhook_url, 
-                data=json.dumps(payload), 
-                headers=headers
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
             )
             response.raise_for_status()
-            
-            logger.debug(f"Discord notification sent successfully. Status code: {response.status_code}")
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to send Discord notification: {str(e)}")
-            logger.debug(traceback.format_exc())
+            logger.error(f"Failed to send signal notification: {e}")
             return False
+    
+    def send_trade_execution_notification(self, trade_result: Dict[str, Any]) -> bool:
+        """
+        Send notification about executed trade.
+        
+        Args:
+            trade_result: Dictionary with trade details
+            
+        Returns:
+            True if notification was sent, False otherwise
+        """
+        if not self.enabled or not self.notification_levels.get('trade_alerts', True):
+            return False
+            
+        webhook_url = self.webhooks.get('trade_alerts')
+        if not webhook_url:
+            logger.warning("No trade_alerts webhook URL configured")
+            return False
+        
+        # Determine if this is a buy or sell
+        is_buy = trade_result.get('type', '').upper() == 'BUY'
+        color = 0x2ecc71 if is_buy else 0xe74c3c  # Green for buy, red for sell
+        
+        # Format the message
+        title = f"{'🟢 BUY' if is_buy else '🔴 SELL'} - {trade_result.get('symbol', 'Unknown')}"
+        
+        description = f"**Price:** ₹{trade_result.get('price', 0):.2f}\n"
+        description += f"**Quantity:** {trade_result.get('quantity', 0)}\n"
+        description += f"**Value:** ₹{trade_result.get('value', 0):.2f}\n"
+        description += f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        if is_buy:
+            if trade_result.get('take_profit'):
+                description += f"**Take Profit:** ₹{trade_result.get('take_profit'):.2f}\n"
+            if trade_result.get('stop_loss'):
+                description += f"**Stop Loss:** ₹{trade_result.get('stop_loss'):.2f}\n"
+        else:
+            if trade_result.get('pnl'):
+                pnl = trade_result.get('pnl', 0)
+                pnl_percent = trade_result.get('pnl_percent', 0)
+                pnl_emoji = "🟢" if pnl > 0 else "🔴"
+                description += f"**P&L:** {pnl_emoji} ₹{pnl:.2f} ({pnl_percent:.2f}%)\n"
+            
+            if trade_result.get('exit_reason'):
+                description += f"**Exit Reason:** {trade_result.get('exit_reason')}\n"
+        
+        # Create embed
+        embed = {
+            "title": title,
+            "description": description,
+            "color": color,
+            "timestamp": datetime.now().isoformat(),
+            "footer": {
+                "text": "ZT-3 Trading System"
+            }
+        }
+        
+        payload = {
+            "embeds": [embed]
+        }
+        
+        try:
+            response = requests.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send trade execution notification: {e}")
+            return False
+    
+    def send_backtest_results(self, metrics: Dict[str, Any]) -> bool:
+        """
+        Send backtest results notification.
+        
+        Args:
+            metrics: Dictionary with backtest metrics
+            
+        Returns:
+            True if notification was sent, False otherwise
+        """
+        if not self.enabled:
+            logger.debug("Discord notifications disabled")
+            return False
+            
+        webhook_url = self.webhooks.get('backtest_results')
+        if not webhook_url:
+            logger.warning("No backtest_results webhook URL configured")
+            return False
+        
+        # Format metrics for Discord
+        strategy_name = metrics.get('strategy_name', 'ZT-3 Strategy')
+        symbol = metrics.get('symbol', 'Unknown')
+        
+        # Determine color based on performance
+        total_return = metrics.get('total_return_percent', 0)
+        if total_return > 5:
+            color = 0x2ecc71  # Strong green for good profit
+        elif total_return > 0:
+            color = 0x27ae60  # Light green for profit
+        elif total_return > -5:
+            color = 0xe74c3c  # Light red for loss
+        else:
+            color = 0xc0392b  # Strong red for significant loss
+        
+        # Create description with key metrics
+        description = (
+            f"**Period:** {metrics.get('start_date')} to {metrics.get('end_date')} "
+            f"({metrics.get('duration_days')} days)\n"
+            f"**Starting Capital:** ₹{metrics.get('starting_equity', 0):.2f}\n"
+            f"**Final Equity:** ₹{metrics.get('final_equity', 0):.2f}\n"
+            f"**Total Return:** {metrics.get('total_return_percent', 0):.2f}%\n"
+            f"**Annual Return:** {metrics.get('annual_return_percent', 0):.2f}%\n"
+            f"**Win Rate:** {metrics.get('win_rate_percent', 0):.2f}% "
+            f"({metrics.get('win_trades', 0)} / {metrics.get('total_trades', 0)})\n"
+            f"**Max Drawdown:** {metrics.get('max_drawdown_percent', 0):.2f}%\n"
+            f"**Sharpe Ratio:** {metrics.get('sharpe_ratio', 0):.2f}\n"
+            f"**Profit Factor:** {metrics.get('profit_factor', 0):.2f}\n"
+        )
+        
+        # Create rich embed for Discord
+        embed = {
+            "title": f"📊 Backtest Results: {strategy_name} on {symbol}",
+            "description": description,
+            "color": color,
+            "timestamp": datetime.now().isoformat(),
+            "footer": {
+                "text": "ZT-3 Trading System Backtest"
+            }
+        }
+        
+        payload = {
+            "embeds": [embed]
+        }
+        
+        try:
+            response = requests.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send backtest results notification: {e}")
+            return False
+
+    def send_error_notification(self, title: str, error_msg: str) -> bool:
+        """
+        Send error notification.
+        
+        Args:
+            title: Error title
+            error_msg: Error message
+            
+        Returns:
+            True if notification was sent, False otherwise
+        """
+        return self.send_system_notification(title, error_msg, "error")

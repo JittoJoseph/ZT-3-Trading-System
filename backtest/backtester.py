@@ -15,10 +15,16 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Union, Tuple
 from pathlib import Path
+import requests
+import sys
+from dotenv import load_dotenv
 
 # Import strategy and indicator modules
 from strategy import SignalType, ExitReason, Signal
-from strategy.indicators import Indicators
+from strategy.gaussian_channel import GaussianChannelStrategy
+
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +141,6 @@ class Backtester:
         """
         self.config = config
         self.strategy_name = config.get('strategy', {}).get('name', 'GaussianChannelStrategy')
-        self.strategy_params = config.get('strategy', {}).get('params', {})
         self.symbols = [f"{s['exchange']}:{s['ticker']}" for s in config.get('symbols', [])]
         
         # Trading settings
@@ -154,20 +159,35 @@ class Backtester:
         # Strategy instance
         self.strategy = self._load_strategy()
         
+        # API client for accessing historical data
+        self.api_key = os.environ.get('UPSTOX_API_KEY') or config.get('api', {}).get('api_key')
+        self.api_secret = os.environ.get('UPSTOX_API_SECRET') or config.get('api', {}).get('api_secret')
+        self.access_token = os.environ.get('UPSTOX_ACCESS_TOKEN', '')
+        
+        # API base URLs
+        self.base_url = "https://api.upstox.com/v2"
+        self.historical_url = f"{self.base_url}/historical-candle"
+        
+        # Initialize notification manager for discord alerts
+        try:
+            from utils.notifications import NotificationManager
+            self.notification_manager = NotificationManager(config)
+        except ImportError:
+            logger.warning("NotificationManager not available. Discord notifications will be disabled.")
+            self.notification_manager = None
+        
         logger.info(f"Backtester initialized for {self.strategy_name} with {len(self.symbols)} symbols")
     
     def _load_strategy(self):
         """
-        Load the strategy class dynamically.
+        Load the strategy class based on the configuration.
         
         Returns:
             Strategy instance
         """
         try:
-            # Import the strategy module dynamically
-            from strategy.gaussian_channel import GaussianChannelStrategy
-            
-            # Create and return the strategy instance
+            # Currently we only support GaussianChannelStrategy
+            # In the future this could be more dynamic based on strategy_name
             return GaussianChannelStrategy(self.config)
             
         except Exception as e:
@@ -179,7 +199,7 @@ class Backtester:
                 start_date: str, 
                 end_date: str, 
                 source: str = 'api',
-                interval: str = '5min',
+                interval: str = '5minute',  # Upstox API format
                 csv_path: Optional[str] = None) -> pd.DataFrame:
         """
         Load historical data for a symbol.
@@ -189,17 +209,83 @@ class Backtester:
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
             source: Data source ('api' or 'csv')
-            interval: Timeframe interval
+            interval: Timeframe interval ('1minute', '5minute', '30minute', 'day', 'week', 'month')
             csv_path: Path to CSV file if source is 'csv'
             
         Returns:
             DataFrame with historical data
         """
         if source == 'api':
-            # This would connect to the Upstox API in a real implementation
-            # For backtesting purposes, we'll use local data or mock data
-            logger.warning("API data fetching not implemented yet, using sample data")
-            df = self._generate_sample_data(symbol, start_date, end_date, interval)
+            # Parse exchange and ticker from symbol
+            parts = symbol.split(':')
+            if len(parts) != 2:
+                raise ValueError(f"Invalid symbol format: {symbol}. Expected format: 'exchange:ticker'")
+            
+            exchange, ticker = parts
+            
+            # Maximum number of retry attempts
+            max_retries = 3
+            retry_delay = 5  # seconds
+            retry_attempt = 0
+            last_error = None
+            
+            while retry_attempt < max_retries:
+                try:
+                    # Check if we have access token
+                    if not self.access_token:
+                        error_msg = "No access token available for API request. Please run utils/get_token.py first."
+                        logger.error(error_msg)
+                        if self.notification_manager:
+                            self.notification_manager.send_system_notification(
+                                "Authentication Error", 
+                                error_msg, 
+                                "error"
+                            )
+                        raise ValueError(error_msg)
+                    
+                    # Fetch historical data from API
+                    logger.info(f"Attempt {retry_attempt+1}/{max_retries}: Fetching historical data for {symbol} from {start_date} to {end_date}")
+                    df = self._fetch_historical_data(ticker, exchange, interval, start_date, end_date)
+                    
+                    if df.empty:
+                        logger.warning(f"No data returned from API for {symbol}")
+                        retry_attempt += 1
+                        if retry_attempt < max_retries:
+                            logger.info(f"Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            error_msg = f"No historical data available for {symbol} from {start_date} to {end_date} after {max_retries} attempts"
+                            logger.error(error_msg)
+                            if self.notification_manager:
+                                self.notification_manager.send_system_notification(
+                                    "Data Fetch Error", 
+                                    error_msg, 
+                                    "error"
+                                )
+                            raise ValueError(error_msg)
+                    
+                    # Successfully fetched data
+                    break
+                    
+                except Exception as e:
+                    last_error = str(e)
+                    logger.error(f"Error fetching data from API (attempt {retry_attempt+1}/{max_retries}): {e}")
+                    retry_attempt += 1
+                    
+                    if retry_attempt < max_retries:
+                        logger.info(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                    else:
+                        error_msg = f"Failed to fetch historical data for {symbol} after {max_retries} attempts: {str(e)}"
+                        logger.error(error_msg)
+                        if self.notification_manager:
+                            self.notification_manager.send_system_notification(
+                                "Data Fetch Failed", 
+                                error_msg, 
+                                "error"
+                            )
+                        raise ValueError(error_msg)
         
         elif source == 'csv':
             if not csv_path:
@@ -219,7 +305,7 @@ class Backtester:
             raise ValueError(f"Unsupported data source: {source}")
         
         # Add technical indicators required by the strategy
-        df = Indicators.add_all_indicators(df, self.config)
+        df = self.strategy.prepare_data(df)
         
         # Store the data
         self.data[symbol] = df
@@ -227,106 +313,73 @@ class Backtester:
         logger.info(f"Loaded {len(df)} data points for {symbol} from {start_date} to {end_date}")
         return df
     
-    def _generate_sample_data(self, 
-                            symbol: str, 
-                            start_date: str, 
-                            end_date: str,
-                            interval: str) -> pd.DataFrame:
+    def _fetch_historical_data(self, ticker: str, exchange: str, interval: str, from_date: str, to_date: str) -> pd.DataFrame:
         """
-        Generate sample data for testing when API data is not available.
+        Fetch historical data from Upstox API.
         
         Args:
-            symbol: Trading symbol
-            start_date: Start date
-            end_date: End date
+            ticker: Trading symbol
+            exchange: Exchange code
             interval: Timeframe interval
+            from_date: Start date in YYYY-MM-DD format
+            to_date: End date in YYYY-MM-DD format
             
         Returns:
-            DataFrame with sample data
+            DataFrame with historical data
         """
-        # Convert dates to datetime
-        start = pd.Timestamp(start_date)
-        end = pd.Timestamp(end_date)
+        # Format instrument key
+        instrument_key = f"{exchange}:{ticker}"
         
-        # Determine frequency from interval
-        freq_map = {
-            '1min': '1min',
-            '5min': '5min',
-            '15min': '15min',
-            '30min': '30min',
-            '1h': '60min',
-            'day': '1D'
+        # Set up headers and params
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
         }
-        freq = freq_map.get(interval, '5min')
         
-        # Generate timestamp range
-        # For market hours only (9:15 AM to 3:30 PM, Monday to Friday)
-        timestamps = []
-        current = start
-        while current <= end:
-            # Skip weekends
-            if current.weekday() < 5:  # Monday to Friday
-                # Add timestamps for market hours
-                market_open = current.replace(hour=9, minute=15)
-                market_close = current.replace(hour=15, minute=30)
-                
-                if freq in ['1min', '5min', '15min', '30min', '60min']:
-                    # Generate intraday timestamps
-                    time = market_open
-                    while time <= market_close:
-                        timestamps.append(time)
-                        time += pd.Timedelta(freq)
-                else:
-                    # Daily or higher frequency
-                    timestamps.append(current)
+        params = {
+            'instrument_key': instrument_key,
+            'interval': interval,
+            'to_date': to_date,
+            'from_date': from_date
+        }
+        
+        logger.info(f"Fetching historical data for {instrument_key} from {from_date} to {to_date} with interval {interval}")
+        
+        # Make the API request
+        response = requests.get(self.historical_url, headers=headers, params=params)
+        response.raise_for_status()  # Raise exception for 4XX/5XX responses
+        
+        data = response.json()
+        
+        if data.get('status') == 'success':
+            candles = data.get('data', {}).get('candles', [])
             
-            # Move to next day
-            if freq in ['1D', '1W', '1M']:
-                current += pd.Timedelta(freq)
-            else:
-                current += pd.Timedelta(days=1)
-        
-        # Generate sample prices
-        n = len(timestamps)
-        
-        # Start with a random price
-        base_price = 100 + 50 * np.random.random()
-        
-        # Generate price series with some randomness and trend
-        np.random.seed(42)  # For reproducibility
-        
-        # Create price series with random walk and some cyclical behavior
-        price_changes = np.random.normal(0, 1, n) * 0.5  # Daily random changes
-        trend = np.linspace(0, 10, n) * 0.1  # Slight upward trend
-        cycle = 5 * np.sin(np.linspace(0, 5 * np.pi, n))  # Cyclical component
-        
-        # Combine all components
-        closes = base_price + np.cumsum(price_changes) + trend + cycle
-        
-        # Generate other OHLC data
-        daily_volatility = 0.02
-        opens = closes - np.random.normal(0, daily_volatility, n) * closes
-        highs = np.maximum(opens, closes) + np.random.normal(daily_volatility, daily_volatility, n) * closes
-        lows = np.minimum(opens, closes) - np.random.normal(daily_volatility, daily_volatility, n) * closes
-        
-        # Generate volume data
-        volumes = np.random.lognormal(10, 1, n) * 1000
-        
-        # Create DataFrame
-        df = pd.DataFrame({
-            'timestamp': timestamps,
-            'open': opens,
-            'high': highs,
-            'low': lows,
-            'close': closes,
-            'volume': volumes
-        })
-        
-        # Set timestamp as index
-        df.set_index('timestamp', inplace=True)
-        
-        return df
-    
+            # Convert to DataFrame
+            if not candles:
+                logger.warning(f"No historical candles returned for {instrument_key}")
+                return pd.DataFrame()
+            
+            # Create DataFrame from candles data
+            df = pd.DataFrame(candles, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'
+            ])
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # Set timestamp as index
+            df.set_index('timestamp', inplace=True)
+            
+            # Drop open interest column as we don't need it
+            if 'oi' in df.columns:
+                df.drop(columns=['oi'], inplace=True)
+            
+            logger.info(f"Retrieved {len(df)} historical candles for {instrument_key}")
+            return df
+        else:
+            logger.error(f"API returned error: {data}")
+            return pd.DataFrame()
+
     def run_backtest(self, 
                    start_date: Optional[str] = None, 
                    end_date: Optional[str] = None) -> Dict[str, Any]:
@@ -364,112 +417,67 @@ class Backtester:
             if end_date:
                 df = df[df.index <= pd.Timestamp(end_date)]
             
-            # Iterate through each candle
-            for i in range(len(df)):
-                # Skip the first few candles until we have enough data for indicators
-                if i < max(self.strategy_params.get('gc_period', 144), 50):
-                    continue
+            # Generate signals using the strategy
+            signals = self.strategy.generate_signals(df, symbol)
+            
+            # Process signals in chronological order
+            for signal in sorted(signals, key=lambda s: s.timestamp):
+                timestamp = signal.timestamp
                 
-                # Get current candle and data up to current candle
-                data_until_current = df.iloc[:i+1]
-                current_candle = df.iloc[i]
-                timestamp = current_candle.name  # Index is timestamp
-                
-                # Check for exit conditions first (for open trades)
-                if symbol in open_trades:
+                if signal.signal_type == SignalType.ENTRY and symbol not in open_trades:
+                    # Entry signal
+                    entry_price = self._apply_slippage(signal.price, True)
+                    
+                    # Calculate position size (fixed percentage of capital)
+                    capital_percent = self.config.get('risk', {}).get('capital_percent', 95.0) / 100.0
+                    position_size = int((cash * capital_percent) / entry_price)
+                    
+                    if position_size > 0:
+                        # Calculate commission
+                        commission = self._calculate_commission(entry_price, position_size)
+                        
+                        # Create trade
+                        trade = Trade(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            entry_time=timestamp,
+                            quantity=position_size,
+                            take_profit=signal.take_profit_level,
+                            stop_loss=signal.stop_loss_level
+                        )
+                        
+                        # Update cash and add to open trades
+                        cash -= (entry_price * position_size + commission)
+                        open_trades[symbol] = trade
+                        
+                        logger.debug(f"Backtest: Entry for {symbol} at {entry_price:.2f}, Qty: {position_size}")
+                        
+                elif signal.signal_type == SignalType.EXIT and symbol in open_trades:
+                    # Exit signal
+                    exit_price = self._apply_slippage(signal.price, False)
                     trade = open_trades[symbol]
-                    current_price = current_candle['close']
+                    exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
                     
-                    # Check stop loss
-                    if trade.stop_loss and current_candle['low'] <= trade.stop_loss:
-                        # Stop loss hit
-                        exit_price = self._apply_slippage(trade.stop_loss, False)
-                        trade_pnl = trade.close(exit_price, timestamp, "STOP_LOSS")
-                        
-                        # Update cash and remove from open trades
-                        cash += trade.entry_price * trade.quantity + trade_pnl - self._calculate_commission(exit_price, trade.quantity)
-                        self.trades.append(trade)
-                        del open_trades[symbol]
-                        
-                        logger.info(f"Backtest: Stop loss hit for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
-                        
-                    # Check take profit
-                    elif trade.take_profit and current_candle['high'] >= trade.take_profit:
-                        # Take profit hit
-                        exit_price = self._apply_slippage(trade.take_profit, False)
-                        trade_pnl = trade.close(exit_price, timestamp, "TAKE_PROFIT")
-                        
-                        # Update cash and remove from open trades
-                        cash += trade.entry_price * trade.quantity + trade_pnl - self._calculate_commission(exit_price, trade.quantity)
-                        self.trades.append(trade)
-                        del open_trades[symbol]
-                        
-                        logger.info(f"Backtest: Take profit hit for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
-                
-                # Process with strategy
-                try:
-                    signal = self.strategy.process_candle(data_until_current, symbol)
+                    # Close trade
+                    trade_pnl = trade.close(exit_price, timestamp, exit_reason)
                     
-                    if signal:
-                        if signal.signal_type == SignalType.ENTRY and symbol not in open_trades:
-                            # Entry signal
-                            entry_price = self._apply_slippage(signal.price, True)
-                            
-                            # Calculate position size (fixed percentage of capital)
-                            capital_percent = self.config.get('risk', {}).get('capital_percent', 95.0) / 100.0
-                            position_size = int((cash * capital_percent) / entry_price)
-                            
-                            if position_size > 0:
-                                # Calculate commission
-                                commission = self._calculate_commission(entry_price, position_size)
-                                
-                                # Create trade
-                                trade = Trade(
-                                    symbol=symbol,
-                                    entry_price=entry_price,
-                                    entry_time=timestamp,
-                                    quantity=position_size,
-                                    take_profit=signal.take_profit_level,
-                                    stop_loss=signal.stop_loss_level
-                                )
-                                
-                                # Update cash and add to open trades
-                                cash -= (entry_price * position_size + commission)
-                                open_trades[symbol] = trade
-                                
-                                logger.info(f"Backtest: Entry for {symbol} at {entry_price:.2f}, Qty: {position_size}")
-                                
-                        elif signal.signal_type == SignalType.EXIT and symbol in open_trades:
-                            # Exit signal
-                            exit_price = self._apply_slippage(signal.price, False)
-                            trade = open_trades[symbol]
-                            exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
-                            
-                            # Close trade
-                            trade_pnl = trade.close(exit_price, timestamp, exit_reason)
-                            
-                            # Update cash and remove from open trades
-                            cash += trade.entry_price * trade.quantity + trade_pnl - self._calculate_commission(exit_price, trade.quantity)
-                            self.trades.append(trade)
-                            del open_trades[symbol]
-                            
-                            logger.info(f"Backtest: Exit for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
-                
-                except Exception as e:
-                    logger.error(f"Error during backtest for {symbol} at {timestamp}: {e}")
+                    # Update cash and remove from open trades
+                    cash += trade.quantity * exit_price - self._calculate_commission(exit_price, trade.quantity)
+                    self.trades.append(trade)
+                    del open_trades[symbol]
+                    
+                    logger.debug(f"Backtest: Exit for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
                 
                 # Calculate equity at this point
                 current_equity = cash
                 for sym, trade in open_trades.items():
-                    # For open trades, use current price
-                    if sym == symbol:
-                        current_price = current_candle['close']
-                    else:
-                        # For other symbols, use the most recent price
-                        current_price = self.data[sym].loc[self.data[sym].index <= timestamp, 'close'][-1]
+                    # For open trades, use price at current timestamp
+                    current_price = df.loc[df.index <= timestamp, 'close'][-1] if sym == symbol else \
+                                   self.data[sym].loc[self.data[sym].index <= timestamp, 'close'][-1]
                     
                     # Add unrealized P&L to equity
-                    current_equity += trade.quantity * current_price - trade.entry_price * trade.quantity
+                    position_value = trade.quantity * current_price
+                    current_equity += position_value
                 
                 # Record equity for equity curve
                 equity_curve.append({
@@ -477,41 +485,79 @@ class Backtester:
                     'equity': current_equity
                 })
                 
-                # Calculate daily return if this is the last candle of the day
-                if i == len(df) - 1 or df.index[i].date() != df.index[i+1].date():
-                    if len(equity_curve) > 1:
-                        prev_day_equity = next(
-                            (point['equity'] for point in reversed(equity_curve[:-1]) 
-                             if point['timestamp'].date() < timestamp.date()), 
-                            self.starting_capital
-                        )
-                        
-                        daily_return = (current_equity - prev_day_equity) / prev_day_equity
-                        daily_returns.append({
-                            'date': timestamp.date(),
-                            'return': daily_return
-                        })
+                # Calculate daily return if this is end of day
+                current_date = timestamp.date()
+                next_day = False
+                if len(equity_curve) > 1:
+                    last_date = equity_curve[-2]['timestamp'].date()
+                    next_day = current_date != last_date
+                
+                if next_day:
+                    # Find previous day's equity
+                    prev_day_equity = next(
+                        (point['equity'] for point in reversed(equity_curve[:-1]) 
+                         if point['timestamp'].date() < current_date), 
+                        self.starting_capital
+                    )
+                    
+                    daily_return = (current_equity - prev_day_equity) / prev_day_equity
+                    daily_returns.append({
+                        'date': current_date,
+                        'return': daily_return
+                    })
         
         # Close any remaining open trades at the end of the backtest
         for symbol, trade in list(open_trades.items()):
             last_price = self.data[symbol]['close'][-1]
             exit_price = self._apply_slippage(last_price, False)
-            trade_pnl = trade.close(exit_price, df.index[-1], "END_OF_BACKTEST")
+            trade_pnl = trade.close(exit_price, self.data[symbol].index[-1], "END_OF_BACKTEST")
             
             # Update cash
-            cash += trade.entry_price * trade.quantity + trade_pnl - self._calculate_commission(exit_price, trade.quantity)
+            cash += trade.quantity * exit_price - self._calculate_commission(exit_price, trade.quantity)
             self.trades.append(trade)
             
             logger.info(f"Backtest: Closing remaining trade for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
         
         # Convert equity curve and daily returns to DataFrames
-        self.equity_curve = pd.DataFrame(equity_curve).set_index('timestamp')
-        daily_returns_df = pd.DataFrame(daily_returns).set_index('date')
-        
-        # Calculate performance metrics
-        self.metrics = self._calculate_metrics(self.equity_curve, daily_returns_df)
-        
-        logger.info(f"Backtest completed: {self.metrics['total_trades']} trades, Final equity: {self.metrics['final_equity']:.2f}")
+        if equity_curve:
+            self.equity_curve = pd.DataFrame(equity_curve).set_index('timestamp')
+            
+            # Calculate performance metrics
+            daily_returns_df = pd.DataFrame(daily_returns).set_index('date') if daily_returns else \
+                              pd.DataFrame(columns=['return']).set_index(pd.Index([], name='date'))
+            
+            self.metrics = self._calculate_metrics(self.equity_curve, daily_returns_df)
+            
+            logger.info(f"Backtest completed: {self.metrics['total_trades']} trades, Final equity: {self.metrics['final_equity']:.2f}")
+        else:
+            # No trades were executed
+            self.equity_curve = pd.DataFrame(columns=['equity'])
+            self.metrics = {
+                'start_date': start_date or 'N/A',
+                'end_date': end_date or 'N/A',
+                'duration_days': 0,
+                'starting_equity': self.starting_capital,
+                'final_equity': self.starting_capital,
+                'total_return': 0,
+                'total_return_percent': 0,
+                'annual_return': 0,
+                'annual_return_percent': 0,
+                'max_drawdown': 0,
+                'max_drawdown_percent': 0,
+                'sharpe_ratio': 0,
+                'total_trades': 0,
+                'win_trades': 0,
+                'loss_trades': 0,
+                'win_rate': 0,
+                'win_rate_percent': 0,
+                'avg_profit': 0,
+                'avg_loss': 0,
+                'profit_factor': 0,
+                'expectancy': 0,
+                'avg_trade': 0,
+                'avg_duration_minutes': 0
+            }
+            logger.warning("Backtest completed with no trades")
         
         return self.metrics
     
@@ -528,7 +574,7 @@ class Backtester:
         """
         if self.slippage_percent == 0:
             return price
-            
+        
         # Calculate slippage amount
         slippage_amount = price * self.slippage_percent / 100.0
         
@@ -633,7 +679,7 @@ class Backtester:
             'profit_factor': profit_factor,
             'expectancy': expectancy,
             'avg_trade': avg_trade,
-            'avg_duration_minutes': avg_duration,
+            'avg_duration_minutes': avg_duration
         }
     
     def save_results(self, output_dir: str) -> Dict[str, str]:
@@ -732,6 +778,25 @@ class Backtester:
         plt.savefig(filename)
         plt.close()
     
+    @property
+    def strategy_params(self) -> Dict[str, Any]:
+        """Get the strategy parameters for reporting."""
+        if isinstance(self.strategy, GaussianChannelStrategy):
+            return {
+                'gc_period': self.strategy.gc_period,
+                'gc_multiplier': self.strategy.gc_multiplier,
+                'gc_poles': self.strategy.gc_poles,
+                'stoch_rsi_length': self.strategy.stoch_rsi_length,
+                'stoch_length': self.strategy.stoch_length,
+                'stoch_k_smooth': self.strategy.stoch_k_smooth,
+                'stoch_upper_band': self.strategy.stoch_upper_band,
+                'use_volume_filter': self.strategy.use_volume_filter,
+                'vol_ma_length': self.strategy.vol_ma_length,
+                'use_take_profit': self.strategy.use_take_profit,
+                'atr_tp_multiplier': self.strategy.atr_tp_multiplier
+            }
+        return {}
+        
     def _generate_html_report(self, filename: str) -> None:
         """
         Generate HTML backtest report.
@@ -753,7 +818,6 @@ class Backtester:
         trades_html = ""
         for i, trade in enumerate(self.trades[:100]):  # Limit to first 100 trades
             trade_dict = trade.to_dict()
-            
             trades_html += "<tr>"
             trades_html += f"<td>{i+1}</td>"
             trades_html += f"<td>{trade_dict['symbol']}</td>"

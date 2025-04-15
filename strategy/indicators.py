@@ -3,6 +3,9 @@ Technical Indicators Module for ZT-3 Trading System.
 
 This module provides implementations of various technical indicators
 used by the trading strategies, including the Gaussian Channel indicator.
+
+Note: The GaussianChannelStrategy now implements its own indicators directly
+to match PineScript exactly. This module is kept for other strategies or utilities.
 """
 
 import logging
@@ -16,8 +19,8 @@ class Indicators:
     """
     Technical indicators for trading strategies.
     
-    This class implements various technical indicators used by trading strategies,
-    particularly focused on implementing the Gaussian Channel strategy indicators.
+    This class implements various technical indicators that may be used
+    by different trading strategies.
     """
     
     @staticmethod
@@ -192,67 +195,5 @@ class Indicators:
         
         # Drop temporary columns
         result.drop(columns=['tr0', 'tr1', 'tr2', 'tr'], inplace=True)
-        
-        return result
-        
-    @staticmethod
-    def add_all_indicators(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
-        """
-        Add all indicators required by the Gaussian Channel strategy.
-        
-        Args:
-            df: DataFrame with price and volume data
-            config: Strategy configuration
-            
-        Returns:
-            DataFrame with all indicators added
-        """
-        # Extract parameters from config or use defaults
-        gc_params = config.get('strategy', {}).get('params', {}).get('gaussian_channel', {})
-        gc_period = gc_params.get('period', 144)
-        gc_multiplier = gc_params.get('multiplier', 1.2)
-        
-        stoch_params = config.get('strategy', {}).get('params', {}).get('stochastic_rsi', {})
-        rsi_period = stoch_params.get('rsi_period', 14)
-        stoch_period = stoch_params.get('stoch_period', 14)
-        k_smoothing = stoch_params.get('k_smoothing', 3)
-        d_smoothing = stoch_params.get('d_smoothing', 3)
-        
-        volume_params = config.get('strategy', {}).get('params', {}).get('volume', {})
-        volume_ma_period = volume_params.get('ma_period', 20)
-        
-        atr_params = config.get('strategy', {}).get('params', {}).get('atr', {})
-        atr_period = atr_params.get('period', 14)
-        
-        # Apply indicators
-        result = df.copy()
-        
-        # Add Gaussian Channel indicator
-        result = Indicators.gaussian_channel(
-            result, 
-            period=gc_period,
-            multiplier=gc_multiplier
-        )
-        
-        # Add Stochastic RSI
-        result = Indicators.stochastic_rsi(
-            result,
-            rsi_period=rsi_period,
-            stoch_period=stoch_period,
-            k_smoothing=k_smoothing,
-            d_smoothing=d_smoothing
-        )
-        
-        # Add Volume Analysis
-        result = Indicators.volume_analysis(
-            result,
-            ma_period=volume_ma_period
-        )
-        
-        # Add ATR
-        result = Indicators.atr(
-            result,
-            period=atr_period
-        )
         
         return result

@@ -16,159 +16,141 @@ logger = logging.getLogger(__name__)
 
 class CandleAggregator:
     """
-    Aggregates tick data into OHLC candles of specified intervals.
+    Aggregates real-time tick data into OHLC candles.
     
-    This class processes incoming tick data and generates OHLC candles
-    for different timeframes, with proper time alignment.
+    Supports multiple symbols and timeframes simultaneously.
     """
     
-    def __init__(self, symbols: List[str], intervals: List[str] = None):
+    def __init__(self, symbols: List[str], timeframes: List[str]):
         """
-        Initialize the candle aggregator.
+        Initialize candle aggregator.
         
         Args:
-            symbols: List of symbols to aggregate candles for
-            intervals: List of interval strings ('1min', '5min', '15min', '30min', '1h', '1d')
-                      Default: ['5min'] if None is provided
+            symbols: List of symbols to track
+            timeframes: List of timeframe intervals (e.g., '1min', '5min')
         """
         self.symbols = symbols
-        self.intervals = intervals or ['5min']
+        self.timeframes = timeframes
         
-        # Validate intervals
-        valid_intervals = ['1min', '5min', '15min', '30min', '1h', '1d']
-        for interval in self.intervals:
-            if interval not in valid_intervals:
-                logger.warning(f"Unsupported interval: {interval} - will be ignored")
-        
-        # Dictionary to store tick data for each symbol
-        self.ticks = {symbol: [] for symbol in symbols}
-        
-        # Dictionary to store partial candles for each symbol and interval
-        # {symbol: {interval: partial_candle}}
-        self.partial_candles = {}
-        
-        # Dictionary to store completed candles for each symbol and interval
-        # {symbol: {interval: [candles]}}
-        self.candles = {}
-        
-        # Callbacks for completed candles
-        # {symbol: {interval: [callbacks]}}
-        self.callbacks = defaultdict(lambda: defaultdict(list))
-        
-        # Initialize data structures
-        self._initialize_data_structures()
-        
-        logger.info(f"Initialized candle aggregator for {len(symbols)} symbols with intervals: {intervals}")
+        # Data structures
+        self.candles = defaultdict(lambda: defaultdict(list))  # {symbol: {timeframe: [candles]}}
+        self.partial_candles = defaultdict(lambda: defaultdict(dict))  # {symbol: {timeframe: partial_candle}}
+        self.callbacks = defaultdict(lambda: defaultdict(list))  # {symbol: {timeframe: [callbacks]}}
     
-    def _initialize_data_structures(self) -> None:
-        """Initialize internal data structures for all symbols and intervals."""
-        for symbol in self.symbols:
-            self.partial_candles[symbol] = {}
-            self.candles[symbol] = {}
-            
-            for interval in self.intervals:
-                self.partial_candles[symbol][interval] = None
-                self.candles[symbol][interval] = []
-    
-    def _get_interval_seconds(self, interval: str) -> int:
+    def register_candle_callback(self, symbol: str, timeframe: str, callback: Callable) -> None:
         """
-        Convert interval string to seconds.
+        Register callback for completed candles.
         
         Args:
-            interval: Interval string ('1min', '5min', etc.)
-            
-        Returns:
-            Interval duration in seconds
+            symbol: Symbol to monitor
+            timeframe: Candle timeframe
+            callback: Function to call when candle completes
         """
-        if interval == '1min':
-            return 60
-        elif interval == '5min':
-            return 300
-        elif interval == '15min':
-            return 900
-        elif interval == '30min':
-            return 1800
-        elif interval == '1h':
-            return 3600
-        elif interval == '1d':
-            return 86400
-        else:
-            logger.warning(f"Unsupported interval: {interval} - defaulting to 5min (300s)")
-            return 300
-    
-    def _get_candle_start_time(self, timestamp: datetime, interval: str) -> datetime:
-        """
-        Get the properly aligned start time for a candle.
-        
-        Args:
-            timestamp: Timestamp to align
-            interval: Candle interval
-            
-        Returns:
-            Aligned start time for the candle
-        """
-        interval_seconds = self._get_interval_seconds(interval)
-        
-        if interval == '1min':
-            return timestamp.replace(second=0, microsecond=0)
-        elif interval in ['5min', '15min', '30min']:
-            minutes = (timestamp.minute // (interval_seconds // 60)) * (interval_seconds // 60)
-            return timestamp.replace(minute=minutes, second=0, microsecond=0)
-        elif interval == '1h':
-            return timestamp.replace(minute=0, second=0, microsecond=0)
-        elif interval == '1d':
-            return timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            # Default to 5min
-            minutes = (timestamp.minute // 5) * 5
-            return timestamp.replace(minute=minutes, second=0, microsecond=0)
+        self.callbacks[symbol][timeframe].append(callback)
+        logger.debug(f"Registered candle callback for {symbol} {timeframe}")
     
     def add_tick(self, symbol: str, tick: Dict[str, Any]) -> None:
         """
-        Add a tick to be processed.
+        Add a new price tick to be aggregated.
         
         Args:
-            symbol: Symbol for the tick
-            tick: Tick data dictionary (must contain 'timestamp' and 'price')
+            symbol: Symbol the tick is for
+            tick: Tick data with 'price', 'volume', and 'timestamp' fields
         """
-        if symbol not in self.symbols:
-            logger.warning(f"Tick received for unregistered symbol: {symbol}")
+        price = tick.get('price')
+        volume = tick.get('volume', 0)
+        timestamp = tick.get('timestamp')
+        
+        if not price or not timestamp:
+            logger.warning(f"Incomplete tick data for {symbol}: {tick}")
             return
-        
-        if 'timestamp' not in tick or 'price' not in tick:
-            logger.warning(f"Invalid tick data for {symbol}: {tick}")
-            return
-        
-        # Store the tick
-        self.ticks[symbol].append(tick)
-        
-        # Process ticks for all intervals
-        for interval in self.intervals:
+            
+        # Process for each timeframe
+        for interval in self.timeframes:
             self._process_tick(symbol, tick, interval)
+    
+    def add_bar(self, symbol: str, bar: Dict[str, Any], timeframe: str) -> None:
+        """
+        Add a pre-formed bar/candle directly.
+        
+        Args:
+            symbol: Symbol the bar is for
+            bar: Bar data with OHLCV fields
+            timeframe: Timeframe of the bar
+        """
+        self.candles[symbol][timeframe].append(bar.copy())
+        
+        # Limit stored history
+        if len(self.candles[symbol][timeframe]) > 1000:
+            self.candles[symbol][timeframe] = self.candles[symbol][timeframe][-1000:]
+        
+        # Notify callbacks
+        for callback in self.callbacks[symbol][timeframe]:
+            try:
+                callback(symbol, bar)
+            except Exception as e:
+                logger.error(f"Error in candle callback: {e}")
     
     def _process_tick(self, symbol: str, tick: Dict[str, Any], interval: str) -> None:
         """
-        Process a tick for a specific interval.
+        Process tick for a specific timeframe.
         
         Args:
-            symbol: Symbol for the tick
-            tick: Tick data dictionary
+            symbol: Symbol
+            tick: Tick data
             interval: Candle interval
         """
-        # Get timestamp and price from the tick
+        price = tick['price']
+        volume = tick.get('volume', 0)
         timestamp = tick['timestamp']
-        price = float(tick['price'])
-        volume = float(tick.get('volume', 0))
         
-        # Get the candle start time
-        candle_start = self._get_candle_start_time(timestamp, interval)
+        # Convert interval to timedelta
+        if interval == '1min':
+            td = timedelta(minutes=1)
+        elif interval == '5min':
+            td = timedelta(minutes=5)
+        elif interval == '15min':
+            td = timedelta(minutes=15)
+        elif interval == '30min':
+            td = timedelta(minutes=30)
+        elif interval == '1h':
+            td = timedelta(hours=1)
+        else:
+            logger.warning(f"Unsupported interval: {interval}")
+            return
         
-        # Check if we need to create a new candle
-        if (self.partial_candles[symbol][interval] is None or 
-                candle_start > self.partial_candles[symbol][interval]['timestamp']):
+        # Determine candle start time
+        if isinstance(timestamp, str):
+            timestamp = pd.Timestamp(timestamp)
+        
+        minutes = timestamp.minute
+        seconds = timestamp.second
+        microseconds = timestamp.microsecond
+        
+        if interval == '1min':
+            candle_start = timestamp.replace(second=0, microsecond=0)
+        elif interval == '5min':
+            candle_start = timestamp.replace(minute=(minutes // 5) * 5, second=0, microsecond=0)
+        elif interval == '15min':
+            candle_start = timestamp.replace(minute=(minutes // 15) * 15, second=0, microsecond=0)
+        elif interval == '30min':
+            candle_start = timestamp.replace(minute=(minutes // 30) * 30, second=0, microsecond=0)
+        elif interval == '1h':
+            candle_start = timestamp.replace(minute=0, second=0, microsecond=0)
+        
+        # Check if we have a partial candle for this symbol and timeframe
+        if symbol in self.partial_candles and interval in self.partial_candles[symbol]:
+            partial = self.partial_candles[symbol][interval]
             
-            # If there was a previous candle, complete it and move to history
-            if self.partial_candles[symbol][interval] is not None:
+            # Check if tick belongs to current candle
+            if candle_start == partial['timestamp']:
+                # Update partial candle
+                partial['high'] = max(partial['high'], price)
+                partial['low'] = min(partial['low'], price)
+                partial['close'] = price
+                partial['volume'] += volume
+            else:
+                # Candle is complete, finalize it
                 completed_candle = self.partial_candles[symbol][interval].copy()
                 self.candles[symbol][interval].append(completed_candle)
                 
@@ -182,8 +164,18 @@ class CandleAggregator:
                         callback(symbol, completed_candle)
                     except Exception as e:
                         logger.error(f"Error in candle callback: {e}")
-            
-            # Create new candle
+                
+                # Create new candle
+                self.partial_candles[symbol][interval] = {
+                    'timestamp': candle_start,
+                    'open': price,
+                    'high': price,
+                    'low': price,
+                    'close': price,
+                    'volume': volume
+                }
+        else:
+            # First tick for this symbol and timeframe
             self.partial_candles[symbol][interval] = {
                 'timestamp': candle_start,
                 'open': price,
@@ -192,148 +184,6 @@ class CandleAggregator:
                 'close': price,
                 'volume': volume
             }
-        else:
-            # Update existing candle
-            candle = self.partial_candles[symbol][interval]
-            candle['high'] = max(candle['high'], price)
-            candle['low'] = min(candle['low'], price)
-            candle['close'] = price
-            candle['volume'] += volume
-    
-    def get_last_candle(self, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the last completed candle for a symbol and interval.
-        
-        Args:
-            symbol: Symbol to get candle for
-            interval: Candle interval
-            
-        Returns:
-            Last completed candle data or None if no candle is available
-        """
-        if (symbol not in self.candles or 
-                interval not in self.candles[symbol] or 
-                not self.candles[symbol][interval]):
-            return None
-        
-        return self.candles[symbol][interval][-1]
-    
-    def get_current_candle(self, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the current partial candle for a symbol and interval.
-        
-        Args:
-            symbol: Symbol to get candle for
-            interval: Candle interval
-            
-        Returns:
-            Current partial candle data or None if no candle is available
-        """
-        if (symbol not in self.partial_candles or 
-                interval not in self.partial_candles[symbol]):
-            return None
-        
-        return self.partial_candles[symbol][interval]
-    
-    def get_candles(self, symbol: str, interval: str, count: int = None) -> List[Dict[str, Any]]:
-        """
-        Get completed candles for a symbol and interval.
-        
-        Args:
-            symbol: Symbol to get candles for
-            interval: Candle interval
-            count: Number of candles to return (None for all available)
-            
-        Returns:
-            List of completed candles
-        """
-        if (symbol not in self.candles or 
-                interval not in self.candles[symbol] or 
-                not self.candles[symbol][interval]):
-            return []
-        
-        if count is None:
-            return self.candles[symbol][interval]
-        else:
-            return self.candles[symbol][interval][-count:]
-    
-    def register_candle_callback(self, symbol: str, interval: str, 
-                               callback: Callable[[str, Dict[str, Any]], None]) -> None:
-        """
-        Register a callback for completed candles.
-        
-        Args:
-            symbol: Symbol to register callback for
-            interval: Candle interval
-            callback: Function to call when a candle is completed
-        """
-        self.callbacks[symbol][interval].append(callback)
-    
-    def unregister_candle_callback(self, symbol: str, interval: str, 
-                                 callback: Callable[[str, Dict[str, Any]], None]) -> None:
-        """
-        Unregister a candle callback.
-        
-        Args:
-            symbol: Symbol the callback was registered for
-            interval: Candle interval
-            callback: Callback function to remove
-        """
-        if symbol in self.callbacks and interval in self.callbacks[symbol]:
-            if callback in self.callbacks[symbol][interval]:
-                self.callbacks[symbol][interval].remove(callback)
-    
-    def flush(self, symbol: Optional[str] = None, interval: Optional[str] = None) -> None:
-        """
-        Flush partial candles and complete them.
-        
-        This is useful for end of day processing or shutdown.
-        
-        Args:
-            symbol: Specific symbol to flush (None for all)
-            interval: Specific interval to flush (None for all)
-        """
-        symbols_to_flush = [symbol] if symbol else self.symbols
-        
-        for sym in symbols_to_flush:
-            intervals_to_flush = [interval] if interval else self.intervals
-            
-            for intv in intervals_to_flush:
-                if (sym in self.partial_candles and 
-                        intv in self.partial_candles[sym] and 
-                        self.partial_candles[sym][intv] is not None):
-                    
-                    # Complete the partial candle
-                    completed_candle = self.partial_candles[sym][intv].copy()
-                    self.candles[sym][intv].append(completed_candle)
-                    
-                    # Reset partial candle
-                    self.partial_candles[sym][intv] = None
-                    
-                    # Notify callbacks
-                    for callback in self.callbacks[sym][intv]:
-                        try:
-                            callback(sym, completed_candle)
-                        except Exception as e:
-                            logger.error(f"Error in candle callback during flush: {e}")
-    
-    def clear_data(self, symbol: Optional[str] = None) -> None:
-        """
-        Clear stored tick and candle data.
-        
-        Args:
-            symbol: Specific symbol to clear data for (None for all)
-        """
-        symbols_to_clear = [symbol] if symbol else self.symbols
-        
-        for sym in symbols_to_clear:
-            self.ticks[sym] = []
-            
-            for interval in self.intervals:
-                self.partial_candles[sym][interval] = None
-                self.candles[sym][interval] = []
-        
-        logger.info(f"Cleared data for {len(symbols_to_clear)} symbols")
     
     def to_dataframe(self, symbol: str, interval: str) -> pd.DataFrame:
         """
@@ -358,3 +208,43 @@ class CandleAggregator:
         df.set_index('timestamp', inplace=True)
         
         return df
+    
+    def get_latest_candle(self, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the latest complete candle for a symbol and timeframe.
+        
+        Args:
+            symbol: Symbol
+            interval: Candle interval
+            
+        Returns:
+            Latest candle or None if no candles exist
+        """
+        if (symbol not in self.candles or 
+                interval not in self.candles[symbol] or 
+                not self.candles[symbol][interval]):
+            return None
+            
+        return self.candles[symbol][interval][-1]
+    
+    def get_latest_price(self, symbol: str) -> Optional[float]:
+        """
+        Get the latest price for a symbol.
+        
+        Args:
+            symbol: Symbol
+            
+        Returns:
+            Latest price or None if no data exists
+        """
+        for interval in self.timeframes:
+            # Check partial candles first
+            if symbol in self.partial_candles and interval in self.partial_candles[symbol]:
+                return self.partial_candles[symbol][interval]['close']
+            
+            # Check completed candles
+            if symbol in self.candles and interval in self.candles[symbol]:
+                if self.candles[symbol][interval]:
+                    return self.candles[symbol][interval][-1]['close']
+                    
+        return None
