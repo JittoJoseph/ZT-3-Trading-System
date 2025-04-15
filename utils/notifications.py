@@ -254,78 +254,91 @@ class NotificationManager:
     
     def send_backtest_results(self, metrics: Dict[str, Any]) -> bool:
         """
-        Send backtest results notification.
+        Send backtest results to Discord.
         
         Args:
-            metrics: Dictionary with backtest metrics
+            metrics: Backtest performance metrics
             
         Returns:
-            True if notification was sent, False otherwise
+            True if successful, False otherwise
         """
-        if not self.enabled:
-            logger.debug("Discord notifications disabled")
+        if not self.enabled or not self.webhooks.get('backtest_results'):
             return False
-            
-        webhook_url = self.webhooks.get('backtest_results')
-        if not webhook_url:
-            logger.warning("No backtest_results webhook URL configured")
-            return False
-        
-        # Format metrics for Discord
-        strategy_name = metrics.get('strategy_name', 'ZT-3 Strategy')
-        symbol = metrics.get('symbol', 'Unknown')
-        
-        # Determine color based on performance
-        total_return = metrics.get('total_return_percent', 0)
-        if total_return > 5:
-            color = 0x2ecc71  # Strong green for good profit
-        elif total_return > 0:
-            color = 0x27ae60  # Light green for profit
-        elif total_return > -5:
-            color = 0xe74c3c  # Light red for loss
-        else:
-            color = 0xc0392b  # Strong red for significant loss
-        
-        # Create description with key metrics
-        description = (
-            f"**Period:** {metrics.get('start_date')} to {metrics.get('end_date')} "
-            f"({metrics.get('duration_days')} days)\n"
-            f"**Starting Capital:** ₹{metrics.get('starting_equity', 0):.2f}\n"
-            f"**Final Equity:** ₹{metrics.get('final_equity', 0):.2f}\n"
-            f"**Total Return:** {metrics.get('total_return_percent', 0):.2f}%\n"
-            f"**Annual Return:** {metrics.get('annual_return_percent', 0):.2f}%\n"
-            f"**Win Rate:** {metrics.get('win_rate_percent', 0):.2f}% "
-            f"({metrics.get('win_trades', 0)} / {metrics.get('total_trades', 0)})\n"
-            f"**Max Drawdown:** {metrics.get('max_drawdown_percent', 0):.2f}%\n"
-            f"**Sharpe Ratio:** {metrics.get('sharpe_ratio', 0):.2f}\n"
-            f"**Profit Factor:** {metrics.get('profit_factor', 0):.2f}\n"
-        )
-        
-        # Create rich embed for Discord
-        embed = {
-            "title": f"📊 Backtest Results: {strategy_name} on {symbol}",
-            "description": description,
-            "color": color,
-            "timestamp": datetime.now().isoformat(),
-            "footer": {
-                "text": "ZT-3 Trading System Backtest"
-            }
-        }
-        
-        payload = {
-            "embeds": [embed]
-        }
         
         try:
-            response = requests.post(
-                webhook_url,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
-            response.raise_for_status()
-            return True
+            # Create formatted message
+            embed = {
+                "title": f"📊 Backtest Results: {metrics.get('symbol', 'Unknown')}",
+                "color": 3447003,  # Blue
+                "fields": [
+                    {
+                        "name": "Period",
+                        "value": f"{metrics.get('start_date', 'N/A')} to {metrics.get('end_date', 'N/A')} ({metrics.get('duration_days', 0)} days)",
+                        "inline": False
+                    },
+                    {
+                        "name": "Strategy",
+                        "value": f"{metrics.get('strategy_name', 'Unknown Strategy')}",
+                        "inline": True
+                    },
+                    {
+                        "name": "Total Return",
+                        "value": f"{metrics.get('total_return_percent', 0):.2f}%",
+                        "inline": True
+                    },
+                    {
+                        "name": "Annual Return",
+                        "value": f"{metrics.get('annual_return_percent', 0):.2f}%",
+                        "inline": True
+                    },
+                    {
+                        "name": "Sharpe Ratio",
+                        "value": f"{metrics.get('sharpe_ratio', 0):.2f}",
+                        "inline": True
+                    },
+                    {
+                        "name": "Max Drawdown",
+                        "value": f"{metrics.get('max_drawdown_percent', 0):.2f}%",
+                        "inline": True
+                    },
+                    {
+                        "name": "Win Rate",
+                        "value": f"{metrics.get('win_rate_percent', 0):.2f}%",
+                        "inline": True
+                    },
+                    {
+                        "name": "Profit Factor",
+                        "value": f"{metrics.get('profit_factor', 0):.2f}",
+                        "inline": True
+                    },
+                    {
+                        "name": "Total Trades",
+                        "value": f"{metrics.get('total_trades', 0)}",
+                        "inline": True
+                    }
+                ],
+                "footer": {
+                    "text": f"ZT-3 Backtester • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                },
+                "timestamp": datetime.now().isoformat()  # Use ISO format for timestamp
+            }
+            
+            data = {
+                "username": "ZT-3 Backtester",
+                "embeds": [embed]
+            }
+            
+            response = requests.post(self.webhooks['backtest_results'], json=data)
+            
+            if response.status_code == 204:
+                logger.info("Backtest results sent to Discord")
+                return True
+            else:
+                logger.warning(f"Failed to send backtest results to Discord: {response.status_code} {response.text}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Failed to send backtest results notification: {e}")
+            logger.error(f"Error sending backtest results to Discord: {e}")
             return False
 
     def send_error_notification(self, title: str, error_msg: str) -> bool:

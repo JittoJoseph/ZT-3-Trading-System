@@ -379,8 +379,8 @@ class Backtester:
                     'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'
                 ])
                 
-                # Convert timestamp to datetime
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                # Convert timestamp to datetime and ensure timezone-naive
+                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
                 
                 # Set timestamp as index
                 df.set_index('timestamp', inplace=True)
@@ -501,6 +501,10 @@ class Backtester:
         equity_curve = []
         daily_returns = []
         
+        # Convert date strings to timestamps if provided
+        start_timestamp = pd.Timestamp(start_date) if start_date else None
+        end_timestamp = pd.Timestamp(end_date) if end_date else None
+        
         # Process each symbol
         for symbol in self.symbols:
             if symbol not in self.data:
@@ -510,10 +514,21 @@ class Backtester:
             df = self.data[symbol]
             
             # Filter by date range if provided
-            if start_date:
-                df = df[df.index >= pd.Timestamp(start_date)]
-            if end_date:
-                df = df[df.index <= pd.Timestamp(end_date)]
+            if start_timestamp:
+                # Convert index to timezone-naive for correct comparison
+                if df.index.tz is not None:
+                    df_index_naive = df.index.tz_localize(None)
+                    df = df[df_index_naive >= start_timestamp]
+                else:
+                    df = df[df.index >= start_timestamp]
+                    
+            if end_timestamp:
+                # Convert index to timezone-naive for correct comparison
+                if df.index.tz is not None:
+                    df_index_naive = df.index.tz_localize(None)
+                    df = df[df_index_naive <= end_timestamp]
+                else:
+                    df = df[df.index <= end_timestamp]
             
             # Generate signals using the strategy
             signals = self.strategy.generate_signals(df, symbol)
