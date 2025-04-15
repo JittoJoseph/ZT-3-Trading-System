@@ -199,7 +199,7 @@ class Backtester:
                 start_date: str, 
                 end_date: str, 
                 source: str = 'api',
-                interval: str = '5minute',  # Upstox API format
+                interval: str = '30minute',  # Will be forced to 30minute
                 csv_path: Optional[str] = None) -> pd.DataFrame:
         """
         Load historical data for a symbol.
@@ -209,7 +209,7 @@ class Backtester:
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
             source: Data source ('api' or 'csv')
-            interval: Timeframe interval ('1minute', '5minute', '30minute', 'day', 'week', 'month')
+            interval: Timeframe interval (always '30minute' for Upstox API)
             csv_path: Path to CSV file if source is 'csv'
             
         Returns:
@@ -223,11 +223,13 @@ class Backtester:
             
             exchange, ticker = parts
             
+            # Always use 30minute interval for Upstox API
+            interval = '30minute'
+            
             # Maximum number of retry attempts
             max_retries = 3
             retry_delay = 5  # seconds
             retry_attempt = 0
-            last_error = None
             
             while retry_attempt < max_retries:
                 try:
@@ -269,7 +271,6 @@ class Backtester:
                     break
                     
                 except Exception as e:
-                    last_error = str(e)
                     logger.error(f"Error fetching data from API (attempt {retry_attempt+1}/{max_retries}): {e}")
                     retry_attempt += 1
                     
@@ -317,6 +318,9 @@ class Backtester:
         """
         Fetch historical data from Upstox API.
         
+        According to the Upstox API docs, the historical candle URL format is:
+        https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}
+        
         Args:
             ticker: Trading symbol
             exchange: Exchange code
@@ -327,58 +331,152 @@ class Backtester:
         Returns:
             DataFrame with historical data
         """
-        # Format instrument key
-        instrument_key = f"{exchange}:{ticker}"
+        # Look up the ISIN for this ticker from our mapping or use the instrument key format
+        instrument_key = self._get_instrument_key(ticker, exchange)
         
-        # Set up headers and params
+        # Set up headers as required by the API documentation
         headers = {
             'Accept': 'application/json',
             'Authorization': f'Bearer {self.access_token}'
         }
         
-        params = {
-            'instrument_key': instrument_key,
-            'interval': interval,
-            'to_date': to_date,
-            'from_date': from_date
-        }
+        # URL encode the instrument key
+        encoded_instrument_key = requests.utils.quote(instrument_key)
         
-        logger.info(f"Fetching historical data for {instrument_key} from {from_date} to {to_date} with interval {interval}")
+        # Always use 30minute interval as it's known to work well with the API
+        interval = '30minute'
         
-        # Make the API request
-        response = requests.get(self.historical_url, headers=headers, params=params)
-        response.raise_for_status()  # Raise exception for 4XX/5XX responses
+        # Construct URL according to the API docs format
+        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/30minute/2023-11-13/2023-11-12
+        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{interval}/{to_date}/{from_date}"
         
-        data = response.json()
+        logger.info(f"Fetching historical data from: {url}")
         
-        if data.get('status') == 'success':
-            candles = data.get('data', {}).get('candles', [])
+        try:
+            # Make the API request
+            response = requests.get(url, headers=headers)
             
-            # Convert to DataFrame
-            if not candles:
-                logger.warning(f"No historical candles returned for {instrument_key}")
+            # Check for successful response
+            if response.status_code != 200:
+                logger.error(f"API request failed with status {response.status_code}: {response.text}")
                 return pd.DataFrame()
             
-            # Create DataFrame from candles data
-            df = pd.DataFrame(candles, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'
-            ])
+            # Parse the response JSON
+            data = response.json()
             
-            # Convert timestamp to datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            # Set timestamp as index
-            df.set_index('timestamp', inplace=True)
-            
-            # Drop open interest column as we don't need it
-            if 'oi' in df.columns:
-                df.drop(columns=['oi'], inplace=True)
-            
-            logger.info(f"Retrieved {len(df)} historical candles for {instrument_key}")
-            return df
-        else:
-            logger.error(f"API returned error: {data}")
+            # Check if data was returned successfully
+            if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
+                candles = data['data']['candles']
+                
+                if not candles:
+                    logger.warning(f"No candles returned for {exchange}:{ticker}")
+                    return pd.DataFrame()
+                
+                # Create DataFrame from candles data
+                # According to the documentation, the candle data format is:
+                # [timestamp, open, high, low, close, volume, oi]
+                df = pd.DataFrame(candles, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'
+                ])
+                
+                # Convert timestamp to datetime
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                
+                # Set timestamp as index
+                df.set_index('timestamp', inplace=True)
+                
+                # Drop open interest column if it exists and is not needed
+                if 'oi' in df.columns:
+                    df.drop(columns=['oi'], inplace=True)
+                
+                logger.info(f"Retrieved {len(df)} historical candles for {exchange}:{ticker}")
+                return df
+            else:
+                logger.error(f"Invalid response format: {data}")
+                return pd.DataFrame()
+                
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
             return pd.DataFrame()
+
+    def _get_instrument_key(self, ticker: str, exchange: str) -> str:
+        """
+        Get the correct instrument key for the Upstox API.
+        
+        According to the field pattern documentation, the format is:
+        NSE_EQ|INE160A01022 (exchange_segment|ISIN)
+        
+        Args:
+            ticker: Trading symbol (like PNB)
+            exchange: Exchange code (like NSE)
+            
+        Returns:
+            Properly formatted instrument key
+        """
+        # Hardcoded mapping of ticker to ISIN for common symbols
+        ticker_to_isin = {
+            'PNB': 'INE160A01022',        # Punjab National Bank
+            'SBIN': 'INE062A01020',       # State Bank of India
+            'TATASTEEL': 'INE081A01020',  # Tata Steel
+            'RELIANCE': 'INE002A01018',   # Reliance Industries
+            'INFY': 'INE009A01021',       # Infosys
+            'BANKBARODA': 'INE028A01039', # Bank of Baroda
+            'CANBK': 'INE476A01022',      # Canara Bank
+            'ITC': 'INE154A01025',        # ITC Limited
+            'HDFCBANK': 'INE040A01034',   # HDFC Bank
+            'TCS': 'INE467B01029',        # Tata Consultancy Services
+            'NHPC': 'INE848E01016',       # NHPC Limited
+            'RVNL': 'INE415G01027',       # Rail Vikas Nigam Limited
+            'YESBANK': 'INE528G01035'     # Yes Bank Limited
+        }
+        
+        # Get ISIN if available
+        isin = ticker_to_isin.get(ticker, '')
+        
+        # Create instrument key according to the format in the API documentation
+        if isin:
+            # Use ISIN format: NSE_EQ|INE160A01022
+            instrument_key = f"{exchange}_EQ|{isin}"
+        else:
+            # Fallback to using ticker in case ISIN is not available
+            # Not ideal, but might work for some symbols
+            instrument_key = f"{exchange}_EQ|{ticker}"
+        
+        return instrument_key
+
+    def _save_working_api_config(self, config: Dict[str, Any]) -> None:
+        """
+        Save a working API configuration for future use.
+        
+        Args:
+            config: Working API configuration
+        """
+        try:
+            # Create a directory for storing API configs
+            config_dir = Path('data/api_configs')
+            config_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save the config to a file
+            config_file = config_dir / 'historical_data_config.json'
+            
+            # If the file exists, load it first
+            if config_file.exists():
+                with open(config_file, 'r') as f:
+                    existing_configs = json.load(f)
+            else:
+                existing_configs = []
+            
+            # Add this config if it doesn't exist
+            if config not in existing_configs:
+                existing_configs.append(config)
+                
+                # Save the updated configs
+                with open(config_file, 'w') as f:
+                    json.dump(existing_configs, f, indent=2)
+                    
+                logger.info(f"Saved working API config to {config_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save API config: {e}")
 
     def run_backtest(self, 
                    start_date: Optional[str] = None, 
@@ -408,7 +506,7 @@ class Backtester:
             if symbol not in self.data:
                 logger.warning(f"No data loaded for {symbol}, skipping")
                 continue
-                
+            
             df = self.data[symbol]
             
             # Filter by date range if provided
@@ -431,7 +529,6 @@ class Backtester:
                     # Calculate position size (fixed percentage of capital)
                     capital_percent = self.config.get('risk', {}).get('capital_percent', 95.0) / 100.0
                     position_size = int((cash * capital_percent) / entry_price)
-                    
                     if position_size > 0:
                         # Calculate commission
                         commission = self._calculate_commission(entry_price, position_size)
@@ -559,7 +656,7 @@ class Backtester:
             }
             logger.warning("Backtest completed with no trades")
         
-        return self.metrics
+        return self.metrics    
     
     def _apply_slippage(self, price: float, is_buy: bool) -> float:
         """
@@ -582,7 +679,7 @@ class Backtester:
         if is_buy:
             return price + slippage_amount
         else:
-            return price - slippage_amount
+            return price - slippage_amount    
     
     def _calculate_commission(self, price: float, quantity: int) -> float:
         """
@@ -811,7 +908,6 @@ class Backtester:
                 formatted_value = f"{value:.2f}"
             else:
                 formatted_value = str(value)
-            
             metrics_html += f"<tr><td>{key.replace('_', ' ').title()}</td><td>{formatted_value}</td></tr>"
         
         # Format trades for display
@@ -823,19 +919,16 @@ class Backtester:
             trades_html += f"<td>{trade_dict['symbol']}</td>"
             trades_html += f"<td>{trade_dict['entry_time']}</td>"
             trades_html += f"<td>{trade_dict['entry_price']:.2f}</td>"
-            
             if not trade.is_open:
                 trades_html += f"<td>{trade_dict['exit_time']}</td>"
                 trades_html += f"<td>{trade_dict['exit_price']:.2f}</td>"
                 trades_html += f"<td>{trade_dict['exit_reason']}</td>"
-                
                 # Color code PnL
                 pnl_class = "positive" if trade.pnl > 0 else "negative"
                 trades_html += f"<td class='{pnl_class}'>{trade_dict['pnl']:.2f}</td>"
                 trades_html += f"<td class='{pnl_class}'>{trade_dict['pnl_percent']:.2f}%</td>"
             else:
                 trades_html += "<td colspan='5'>Trade still open</td>"
-            
             trades_html += "</tr>"
         
         # Create HTML template

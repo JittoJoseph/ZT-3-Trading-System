@@ -91,13 +91,7 @@ def parse_arguments():
         help='Logging level'
     )
     
-    # Interval
-    parser.add_argument(
-        '--interval',
-        choices=['1minute', '5minute', '30minute', 'day', 'week', 'month'],
-        default='5minute', 
-        help='Candle interval for backtesting'
-    )
+    # Removed the interval parameter - always use 30minute
     
     return parser.parse_args()
 
@@ -153,7 +147,7 @@ def main():
                 for symbol in backtester.symbols:
                     csv_paths[symbol] = args.csv_path
         
-        logger.info(f"Using {args.data_source} as data source with {args.interval} interval")
+        logger.info(f"Using {args.data_source} as data source with 30minute interval")
         logger.info(f"Date range: {args.start_date} to {args.end_date}")
         
         # Setup notification for backtest start
@@ -176,7 +170,7 @@ def main():
                     start_date=args.start_date,
                     end_date=args.end_date,
                     source=args.data_source,
-                    interval=args.interval,
+                    interval='30minute',  # Always use 30minute
                     csv_path=csv_path
                 )
                 logger.info(f"Loaded data for {symbol}")
