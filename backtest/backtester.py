@@ -381,14 +381,14 @@ class Backtester:
     
     def _fetch_historical_data(self, ticker: str, exchange: str, interval: str, from_date: str, to_date: str) -> pd.DataFrame:
         """
-        Fetch historical data from Upstox API V3.
+        Fetch historical data from Upstox API V2.
 
-        Uses the V3 endpoint: /historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}
+        Uses the V2 endpoint: /v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}
 
         Args:
             ticker: Trading symbol
             exchange: Exchange code
-            interval: Timeframe interval (should always be 'day' now)
+            interval: Timeframe interval (e.g., 'day', '30minute')
             from_date: Start date in YYYY-MM-DD format
             to_date: End date in YYYY-MM-DD format
 
@@ -407,21 +407,26 @@ class Backtester:
         # URL encode the instrument key
         encoded_instrument_key = requests.utils.quote(instrument_key)
 
-        # Determine unit and API interval for V3 based on the hardcoded 'day' interval
-        if interval == 'day':
-            api_unit = 'days'
-            api_interval_value = '1' # V3 uses '1' for daily interval within 'days' unit
-        else:
-            # This part should not be reached if interval is always 'day'
-            logger.error(f"Unsupported interval '{interval}' for V3 API mapping.")
+        # Map internal interval to V2 API interval string (e.g., 'day' -> 'day')
+        # V2 uses simple strings like 'day', 'week', 'month', '1minute', '30minute'
+        api_interval_map_v2 = {
+            '1minute': '1minute', '5minute': '5minute', '10minute': '10minute', # Assuming these might be used elsewhere, though backtester uses 'day'
+            '15minute': '15minute', '30minute': '30minute', '60minute': '60minute',
+            'day': 'day', 'week': 'week', 'month': 'month'
+        }
+        api_interval = api_interval_map_v2.get(interval)
+        if not api_interval:
+            # This should not happen if interval is always 'day' from load_data
+            logger.error(f"Interval '{interval}' not mappable to Upstox V2 API path.")
             return pd.DataFrame()
 
 
-        # Construct URL according to the V3 API docs format
-        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/days/1/2023-11-13/2023-11-01
-        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{api_unit}/{api_interval_value}/{to_date}/{from_date}"
+        # Construct URL according to the V2 API docs format
+        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/day/2023-11-13/2023-11-01
+        # Using self.base_url which is already set to the V2 base.
+        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{api_interval}/{to_date}/{from_date}"
 
-        logger.info(f"Fetching historical data from V3 URL: {url}")
+        logger.info(f"Fetching historical data from V2 URL: {url}")
 
         try:
             # Make the API request

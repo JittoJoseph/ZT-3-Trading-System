@@ -23,7 +23,7 @@ symbols:
 
 # Strategy identifier (no parameters here)
 strategy:
-  name: "GaussianChannel"
+  name: "SwingProStrategy"
 
 # Risk Management Settings
 risk:

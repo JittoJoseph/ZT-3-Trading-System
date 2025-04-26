@@ -78,7 +78,7 @@ class SwingProStrategy(Strategy):
         df = Indicators.ema(df, period=self.trail_ema_len)
         df = Indicators.ema(df, period=self.ema_50_len)
         df = Indicators.ema(df, period=self.ema_200_len)
-        df = Indicators.rsi(df, rsi_period=self.rsi_len)
+        df = Indicators.rsi(df, period=self.rsi_len)
         df = Indicators.macd(df, fast_period=self.macd_fast, slow_period=self.macd_slow, signal_period=self.macd_signal)
         df = Indicators.atr(df, period=self.atr_len)
 
