@@ -18,6 +18,7 @@ from pathlib import Path
 import requests
 import sys
 from dotenv import load_dotenv
+import re # Import the 're' module
 
 # Import strategy and indicator modules
 from strategy import SignalType, ExitReason, Signal
@@ -1057,54 +1058,118 @@ class Backtester:
     
     def save_results(self, output_dir: str) -> Dict[str, str]:
         """
-        Save backtest results to files.
-        
+        Save backtest results to files and clean up old results, keeping only the last 3 runs.
+
         Args:
             output_dir: Directory to save results
-            
+
         Returns:
-            Dictionary with saved file paths
+            Dictionary with saved file paths for the current run
         """
-        # Create output directory
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Generate timestamp for filenames
+        plots_dir = output_path / "plots"
+        plots_dir.mkdir(exist_ok=True)
+
+        # --- Cleanup Logic ---
+        try:
+            # Regex to find timestamp YYYYMMDD_HHMMSS in filenames
+            timestamp_pattern = re.compile(r"_(\d{8}_\d{6})\.(?:csv|json|html|png)$")
+            
+            files_by_timestamp = {}
+            
+            # List all relevant files in output_path and plots_dir
+            all_files = list(output_path.glob("*.csv")) + \
+                        list(output_path.glob("*.json")) + \
+                        list(output_path.glob("*.html")) + \
+                        list(plots_dir.glob("*.png"))
+
+            for file_path in all_files:
+                match = timestamp_pattern.search(file_path.name)
+                if match:
+                    ts = match.group(1)
+                    if ts not in files_by_timestamp:
+                        files_by_timestamp[ts] = []
+                    files_by_timestamp[ts].append(file_path)
+
+            # Sort timestamps (newest first)
+            sorted_timestamps = sorted(files_by_timestamp.keys(), reverse=True)
+
+            # Identify timestamps to delete (keep only the latest 3)
+            timestamps_to_delete = sorted_timestamps[3:]
+
+            if timestamps_to_delete:
+                logger.info(f"Found {len(sorted_timestamps)} result sets. Cleaning up {len(timestamps_to_delete)} older sets...")
+                deleted_count = 0
+                for ts_del in timestamps_to_delete:
+                    for file_to_delete in files_by_timestamp[ts_del]:
+                        try:
+                            file_to_delete.unlink()
+                            deleted_count += 1
+                        except OSError as e:
+                            logger.warning(f"Could not delete old result file {file_to_delete}: {e}")
+                logger.info(f"Deleted {deleted_count} old result files.")
+            else:
+                logger.debug("No old result sets to clean up (found <= 3).")
+
+        except Exception as e:
+            logger.error(f"Error during results cleanup: {e}")
+        # --- End Cleanup Logic ---
+
+
+        # Generate timestamp for current filenames
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         # Save trades to CSV
         trades_file = output_path / f"trades_{timestamp_str}.csv"
         trades_data = [trade.to_dict() for trade in self.trades]
         trades_df = pd.DataFrame(trades_data)
         trades_df.to_csv(trades_file, index=False)
-        
+
         # Save equity curve to CSV
         equity_file = output_path / f"equity_{timestamp_str}.csv"
-        self.equity_curve.to_csv(equity_file)
-        
+        if self.equity_curve is not None and not self.equity_curve.empty:
+             self.equity_curve.to_csv(equity_file)
+        else:
+             # Create an empty file if equity curve is empty/None
+             equity_file.touch()
+             logger.warning("Equity curve is empty, saved an empty equity file.")
+
+
         # Save metrics to JSON
         metrics_file = output_path / f"metrics_{timestamp_str}.json"
         with open(metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=4)
-        
-        # Generate plots
-        plots_dir = output_path / "plots"
-        plots_dir.mkdir(exist_ok=True)
-        
-        # Equity curve plot
+
+        # Generate plots (only if equity curve exists)
         equity_plot_file = plots_dir / f"equity_curve_{timestamp_str}.png"
-        self._plot_equity_curve(equity_plot_file)
-        
-        # Drawdown plot
         drawdown_plot_file = plots_dir / f"drawdown_{timestamp_str}.png"
-        self._plot_drawdown(drawdown_plot_file)
-        
+
+        if self.equity_curve is not None and not self.equity_curve.empty:
+            try:
+                self._plot_equity_curve(equity_plot_file)
+                self._plot_drawdown(drawdown_plot_file)
+            except Exception as e:
+                 logger.error(f"Failed to generate plots: {e}")
+                 # Create empty plot files maybe? Or just log error.
+                 equity_plot_file = Path(str(equity_plot_file) + ".error") # Mark as error
+                 drawdown_plot_file = Path(str(drawdown_plot_file) + ".error")
+        else:
+            logger.warning("Skipping plot generation as equity curve is empty.")
+            # Create empty files to avoid errors in report generation if paths are expected
+            equity_plot_file.touch()
+            drawdown_plot_file.touch()
+
+
         # Generate HTML report
         report_file = output_path / f"report_{timestamp_str}.html"
-        self._generate_html_report(report_file, timestamp_str) # Pass timestamp for plot paths
-        
+        # Pass relative paths for images in the report
+        relative_equity_plot = f"plots/{equity_plot_file.name}"
+        relative_drawdown_plot = f"plots/{drawdown_plot_file.name}"
+        self._generate_html_report(report_file, relative_equity_plot, relative_drawdown_plot)
+
         logger.info(f"Backtest results saved to {output_path}")
-        
+
         return {
             'trades': str(trades_file),
             'equity': str(equity_file),
@@ -1173,13 +1238,14 @@ class Backtester:
             }
         return {}
         
-    def _generate_html_report(self, filename: str, timestamp_str: str) -> None:
+    def _generate_html_report(self, filename: str, equity_plot_path: str, drawdown_plot_path: str) -> None:
         """
         Generate HTML backtest report.
-        
+
         Args:
             filename: File to save the report
-            timestamp_str: Timestamp string used for plot filenames
+            equity_plot_path: Relative path to the equity curve plot image
+            drawdown_plot_path: Relative path to the drawdown plot image
         """
         # Format metrics for display
         metrics_html = ""
@@ -1231,17 +1297,17 @@ class Backtester:
                 .neutral {{ color: black; }}
                 .report-section {{ margin-bottom: 30px; }}
                 .images {{ display: flex; justify-content: space-between; margin-bottom: 20px; }}
-                .images img {{ width: 48%; }}
+                .images img {{ width: 48%; border: 1px solid #ccc; }} /* Added border */
             </style>
         </head>
         <body>
             <div class="report-section">
                 <h1>ZT-3 Trading System Backtest Report</h1>
                 <p>Strategy: {self.strategy_name}</p>
-                <p>Period: {self.metrics['start_date']} to {self.metrics['end_date']} ({self.metrics['duration_days']} days)</p>
+                <p>Period: {self.metrics.get('start_date', 'N/A')} to {self.metrics.get('end_date', 'N/A')} ({self.metrics.get('duration_days', 'N/A')} days)</p>
                 <p>Symbols: {', '.join(self.symbols)}</p>
             </div>
-            
+
             <div class="report-section">
                 <h2>Performance Summary</h2>
                 <table>
@@ -1252,15 +1318,16 @@ class Backtester:
                     {metrics_html}
                 </table>
             </div>
-            
+
             <div class="report-section">
                 <h2>Performance Charts</h2>
                 <div class="images">
-                    <img src="plots/equity_curve_{timestamp_str}.png" alt="Equity Curve">
-                    <img src="plots/drawdown_{timestamp_str}.png" alt="Drawdown">
+                    <!-- Use relative paths passed as arguments -->
+                    <img src="{equity_plot_path}" alt="Equity Curve">
+                    <img src="{drawdown_plot_path}" alt="Drawdown">
                 </div>
             </div>
-            
+
             <div class="report-section">
                 <h2>Trade List</h2>
                 <table>
@@ -1280,19 +1347,21 @@ class Backtester:
                 </table>
                 {f"<p>Showing first 100 out of {len(self.trades)} trades</p>" if len(self.trades) > 100 else ""}
             </div>
-            
+
             <div class="report-section">
                 <h2>Strategy Parameters</h2>
                 <pre>{json.dumps(self.strategy_params, indent=4)}</pre>
             </div>
-            
+
             <footer>
                 <p>Generated by ZT-3 Backtesting Module on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
             </footer>
         </body>
         </html>
         """
-        
+
         # Write HTML to file
         with open(filename, 'w') as f:
             f.write(html)
+
+# ... rest of the Backtester class ...
