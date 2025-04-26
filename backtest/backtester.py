@@ -619,8 +619,11 @@ class Backtester:
                 # Ensure columns match using the correct symbol key
                 candle_df_row = candle_df_row.reindex(columns=processed_data_slices[actual_symbol].columns, fill_value=np.nan)
 
-                # Use concat instead of append
-                processed_data_slices[actual_symbol] = pd.concat([processed_data_slices[actual_symbol], candle_df_row])
+                # Use concat instead of append, handling the initial empty DataFrame case
+                if processed_data_slices[actual_symbol].empty:
+                    processed_data_slices[actual_symbol] = candle_df_row
+                else:
+                    processed_data_slices[actual_symbol] = pd.concat([processed_data_slices[actual_symbol], candle_df_row])
 
                 # Generate signal using data up to current candle for this symbol
                 # Pass the correct symbol string
