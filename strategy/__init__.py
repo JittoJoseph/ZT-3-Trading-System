@@ -22,11 +22,14 @@ class SignalType(enum.Enum):
 class ExitReason(enum.Enum):
     """Enum for exit reasons."""
     TAKE_PROFIT = "TAKE_PROFIT"
+    PARTIAL_TAKE_PROFIT = "PARTIAL_TAKE_PROFIT" # Added
+    STOP_LOSS = "STOP_LOSS" # Added for clarity, was implicit before
     TRAILING_STOP = "TRAILING_STOP"
-    FILTER_CROSS = "FILTER_CROSS"
-    END_OF_DAY = "END_OF_DAY"
+    FILTER_CROSS = "FILTER_CROSS" # Will be EMA_CROSS for new strategy
+    END_OF_DAY = "END_OF_DAY" # Less relevant for daily strategy
     MANUAL = "MANUAL"
     RISK_MANAGER = "RISK_MANAGER"
+    EMA_CROSS = "EMA_CROSS" # Added for new strategy
 
 class Signal:
     """

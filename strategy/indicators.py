@@ -132,7 +132,10 @@ class Indicators:
         
         # Calculate D values (simple moving average of K)
         result['stoch_rsi_d'] = result['stoch_rsi_k'].rolling(window=d_smoothing).mean()
-        
+
+        # Drop intermediate RSI column if not needed elsewhere
+        # result.drop(columns=['rsi'], inplace=True)
+
         return result
     
     @staticmethod
@@ -196,4 +199,63 @@ class Indicators:
         # Drop temporary columns
         result.drop(columns=['tr0', 'tr1', 'tr2', 'tr'], inplace=True)
         
+        return result
+
+    @staticmethod
+    def macd(df: pd.DataFrame, close_col: str = 'close',
+             fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> pd.DataFrame:
+        """
+        Calculate Moving Average Convergence Divergence (MACD).
+
+        Args:
+            df: DataFrame with price data
+            close_col: Column name with close prices
+            fast_period: Period for the fast EMA
+            slow_period: Period for the slow EMA
+            signal_period: Period for the signal line EMA
+
+        Returns:
+            DataFrame with added columns: macd_line, macd_signal, macd_hist
+        """
+        if len(df) < slow_period + signal_period:
+            logger.warning("Not enough data for MACD calculation")
+            return df.copy()
+
+        result = df.copy()
+
+        # Calculate Fast and Slow EMAs
+        ema_fast = result[close_col].ewm(span=fast_period, adjust=False).mean()
+        ema_slow = result[close_col].ewm(span=slow_period, adjust=False).mean()
+
+        # Calculate MACD Line
+        result['macd_line'] = ema_fast - ema_slow
+
+        # Calculate Signal Line (EMA of MACD Line)
+        result['macd_signal'] = result['macd_line'].ewm(span=signal_period, adjust=False).mean()
+
+        # Calculate MACD Histogram
+        result['macd_hist'] = result['macd_line'] - result['macd_signal']
+
+        return result
+
+    @staticmethod
+    def ema(df: pd.DataFrame, source_col: str = 'close', period: int = 20) -> pd.DataFrame:
+        """
+        Calculate Exponential Moving Average (EMA).
+
+        Args:
+            df: DataFrame with price data
+            source_col: Column name to use as source data
+            period: Period for the EMA
+
+        Returns:
+            DataFrame with added column: ema_<period>
+        """
+        if len(df) < period:
+            logger.warning(f"Not enough data for EMA({period}) calculation")
+            return df.copy()
+
+        result = df.copy()
+        ema_col_name = f'ema_{period}'
+        result[ema_col_name] = result[source_col].ewm(span=period, adjust=False).mean()
         return result

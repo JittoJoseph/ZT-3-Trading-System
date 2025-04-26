@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 # Import strategy and indicator modules
 from strategy import SignalType, ExitReason, Signal
-from strategy.gaussian_channel import GaussianChannelStrategy
+from strategy.swing_pro import SwingProStrategy
 
 # Load environment variables
 load_dotenv()
@@ -58,6 +58,10 @@ class Trade:
         self.take_profit = take_profit
         self.stop_loss = stop_loss
         
+        # Add TP levels specific to SwingPro
+        self.take_profit1 = None # For partial exit
+        self.take_profit2 = None # For full exit
+
         # Exit information (to be filled when trade is closed)
         self.exit_price = None
         self.exit_time = None
@@ -66,6 +70,7 @@ class Trade:
         self.pnl_percent = 0.0
         self.is_open = True
         self.duration = None  # To be filled with timedelta
+        self.initial_quantity = quantity # Store initial quantity for partial exit logic
     
     def close(self, 
              exit_price: float, 
@@ -88,11 +93,52 @@ class Trade:
         self.is_open = False
         self.duration = exit_time - self.entry_time
         
-        # Calculate PnL
-        self.pnl = (exit_price - self.entry_price) * self.quantity
-        self.pnl_percent = ((exit_price - self.entry_price) / self.entry_price) * 100
-        
-        return self.pnl
+        # Calculate PnL based on the *original* quantity for full close metrics
+        # PnL calculation might need adjustment if partial closes happened before.
+        # Let's calculate PnL based on the remaining quantity being closed.
+        # The total PnL will be accumulated in the backtester.
+        pnl_on_close = (exit_price - self.entry_price) * self.quantity
+        self.pnl += pnl_on_close # Accumulate PnL if partial close happened
+
+        # PnL percent is tricky after partial closes. Calculate based on initial investment?
+        initial_value = self.entry_price * self.initial_quantity
+        # Final value needs careful calculation considering partial exits.
+        # For simplicity, let's report overall PnL % in metrics, not per trade after partials.
+        self.pnl_percent = (self.pnl / initial_value) * 100 if initial_value else 0
+
+        return pnl_on_close # Return PnL for this closing transaction
+    
+    def partial_close(self,
+                      exit_price: float,
+                      exit_time: datetime,
+                      exit_reason: str,
+                      close_quantity: int) -> float:
+        """
+        Partially close the trade.
+
+        Args:
+            exit_price: Exit price for the partial close.
+            exit_time: Exit timestamp.
+            exit_reason: Reason for partial exit.
+            close_quantity: Quantity to close.
+
+        Returns:
+            Realized PnL for this partial close.
+        """
+        if close_quantity <= 0 or close_quantity > self.quantity:
+            raise ValueError("Invalid quantity for partial close")
+
+        partial_pnl = (exit_price - self.entry_price) * close_quantity
+        self.pnl += partial_pnl # Accumulate PnL
+        self.quantity -= close_quantity # Reduce open quantity
+
+        logger.info(f"Partially closed {close_quantity}/{self.initial_quantity} of {self.symbol} at {exit_price:.2f}. Remaining: {self.quantity}. PnL: {partial_pnl:.2f}")
+
+        # Update duration? Or only set on full close? Let's keep duration for full close.
+        # Update exit reason? Maybe store a list of exit events? Keep it simple for now.
+        # self.exit_reason = f"Partial: {exit_reason}" # Overwrites previous reasons
+
+        return partial_pnl
     
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -105,8 +151,11 @@ class Trade:
             "symbol": self.symbol,
             "entry_price": self.entry_price,
             "entry_time": self.entry_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "quantity": self.quantity,
-            "take_profit": self.take_profit,
+            "quantity": self.quantity, # Current open quantity
+            "initial_quantity": self.initial_quantity, # Added
+            "take_profit": self.take_profit, # Keep for compatibility? Or remove? Let's keep.
+            "take_profit1": self.take_profit1, # Added
+            "take_profit2": self.take_profit2, # Added
             "stop_loss": self.stop_loss,
             "is_open": self.is_open,
         }
@@ -116,8 +165,8 @@ class Trade:
                 "exit_price": self.exit_price,
                 "exit_time": self.exit_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "exit_reason": self.exit_reason,
-                "pnl": self.pnl,
-                "pnl_percent": self.pnl_percent,
+                "pnl": self.pnl, # Accumulated PnL
+                "pnl_percent": self.pnl_percent, # Overall PnL %
                 "duration_minutes": self.duration.total_seconds() / 60 if self.duration else None,
             })
         
@@ -140,7 +189,7 @@ class Backtester:
             config: Configuration dictionary
         """
         self.config = config
-        self.strategy_name = config.get('strategy', {}).get('name', 'GaussianChannelStrategy')
+        self.strategy_name = config.get('strategy', {}).get('name', 'SwingProStrategy')
         self.symbols = [f"{s['exchange']}:{s['ticker']}" for s in config.get('symbols', [])]
         
         # Trading settings
@@ -177,6 +226,8 @@ class Backtester:
             self.notification_manager = None
         
         logger.info(f"Backtester initialized for {self.strategy_name} with {len(self.symbols)} symbols")
+        # Reset strategy state at the beginning of each backtest run
+        self.strategy.reset_position_tracking()
     
     def _load_strategy(self):
         """
@@ -186,32 +237,38 @@ class Backtester:
             Strategy instance
         """
         try:
-            # Currently we only support GaussianChannelStrategy
+            # Currently we only support SwingProStrategy
             # In the future this could be more dynamic based on strategy_name
-            return GaussianChannelStrategy(self.config)
-            
+            if self.strategy_name == 'SwingProStrategy':
+                 return SwingProStrategy(self.config)
+            else:
+                 # Fallback or error for unknown strategy
+                 # For now, assume SwingPro
+                 logger.warning(f"Unknown strategy '{self.strategy_name}', loading SwingProStrategy.")
+                 return SwingProStrategy(self.config)
+
         except Exception as e:
             logger.error(f"Failed to load strategy {self.strategy_name}: {e}")
             raise
-    
-    def load_data(self, 
-                symbol: str, 
-                start_date: str, 
-                end_date: str, 
+
+    def load_data(self,
+                symbol: str,
+                start_date: str,
+                end_date: str,
                 source: str = 'api',
-                interval: str = '30minute',  # Will be forced to 30minute
+                # interval: str = 'day', # Removed interval parameter
                 csv_path: Optional[str] = None) -> pd.DataFrame:
         """
-        Load historical data for a symbol.
-        
+        Load historical data for a symbol. Always uses 'day' interval.
+
         Args:
             symbol: Trading symbol (format: exchange:ticker)
             start_date: Start date in YYYY-MM-DD format
             end_date: End date in YYYY-MM-DD format
             source: Data source ('api' or 'csv')
-            interval: Timeframe interval (always '30minute' for Upstox API)
+            # interval: Timeframe interval (e.g., 'day', '30minute') # Removed
             csv_path: Path to CSV file if source is 'csv'
-            
+
         Returns:
             DataFrame with historical data
         """
@@ -222,10 +279,16 @@ class Backtester:
                 raise ValueError(f"Invalid symbol format: {symbol}. Expected format: 'exchange:ticker'")
             
             exchange, ticker = parts
-            
-            # Always use 30minute interval for Upstox API
-            interval = '30minute'
-            
+
+            # Always use 'day' interval
+            interval = 'day'
+
+            # Validate interval for Upstox API (redundant now, but keep for safety)
+            valid_api_intervals = ['day', 'week', 'month', '1minute', '5minute', '10minute', '15minute', '30minute', '60minute']
+            if interval not in valid_api_intervals:
+                 # This should not happen now
+                 raise ValueError(f"Internal Error: Hardcoded interval '{interval}' is invalid.")
+
             # Maximum number of retry attempts
             max_retries = 3
             retry_delay = 5  # seconds
@@ -246,7 +309,7 @@ class Backtester:
                         raise ValueError(error_msg)
                     
                     # Fetch historical data from API
-                    logger.info(f"Attempt {retry_attempt+1}/{max_retries}: Fetching historical data for {symbol} from {start_date} to {end_date}")
+                    logger.info(f"Attempt {retry_attempt+1}/{max_retries}: Fetching historical data for {symbol} ({interval}) from {start_date} to {end_date}")
                     df = self._fetch_historical_data(ticker, exchange, interval, start_date, end_date)
                     
                     if df.empty:
@@ -306,8 +369,10 @@ class Backtester:
             raise ValueError(f"Unsupported data source: {source}")
         
         # Add technical indicators required by the strategy
-        df = self.strategy.prepare_data(df)
-        
+        # Ensure data is sorted by time before calculating indicators
+        df.sort_index(inplace=True)
+        df = self.strategy.prepare_data(df) # Assumes daily data
+
         # Store the data
         self.data[symbol] = df
         
@@ -316,42 +381,48 @@ class Backtester:
     
     def _fetch_historical_data(self, ticker: str, exchange: str, interval: str, from_date: str, to_date: str) -> pd.DataFrame:
         """
-        Fetch historical data from Upstox API.
-        
-        According to the Upstox API docs, the historical candle URL format is:
-        https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}
-        
+        Fetch historical data from Upstox API V3.
+
+        Uses the V3 endpoint: /historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}
+
         Args:
             ticker: Trading symbol
             exchange: Exchange code
-            interval: Timeframe interval
+            interval: Timeframe interval (should always be 'day' now)
             from_date: Start date in YYYY-MM-DD format
             to_date: End date in YYYY-MM-DD format
-            
+
         Returns:
             DataFrame with historical data
         """
         # Look up the ISIN for this ticker from our mapping or use the instrument key format
         instrument_key = self._get_instrument_key(ticker, exchange)
-        
+
         # Set up headers as required by the API documentation
         headers = {
             'Accept': 'application/json',
             'Authorization': f'Bearer {self.access_token}'
         }
-        
+
         # URL encode the instrument key
         encoded_instrument_key = requests.utils.quote(instrument_key)
-        
-        # Always use 30minute interval as it's known to work well with the API
-        interval = '30minute'
-        
-        # Construct URL according to the API docs format
-        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/30minute/2023-11-13/2023-11-12
-        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{interval}/{to_date}/{from_date}"
-        
-        logger.info(f"Fetching historical data from: {url}")
-        
+
+        # Determine unit and API interval for V3 based on the hardcoded 'day' interval
+        if interval == 'day':
+            api_unit = 'days'
+            api_interval_value = '1' # V3 uses '1' for daily interval within 'days' unit
+        else:
+            # This part should not be reached if interval is always 'day'
+            logger.error(f"Unsupported interval '{interval}' for V3 API mapping.")
+            return pd.DataFrame()
+
+
+        # Construct URL according to the V3 API docs format
+        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/days/1/2023-11-13/2023-11-01
+        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{api_unit}/{api_interval_value}/{to_date}/{from_date}"
+
+        logger.info(f"Fetching historical data from V3 URL: {url}")
+
         try:
             # Make the API request
             response = requests.get(url, headers=headers)
@@ -499,137 +570,188 @@ class Backtester:
         cash = self.starting_capital
         equity = cash
         equity_curve = []
-        daily_returns = []
-        
+        daily_returns = [] # Still relevant even for daily strat, represents return per bar
+
+        # Reset strategy state before iterating data
+        self.strategy.reset_position_tracking()
+
+        # Combine and sort all data by timestamp for chronological processing
+        all_data = pd.concat(self.data.values(), keys=self.symbols, names=['symbol', 'timestamp'])
+        all_data.reset_index(inplace=True)
+        all_data.set_index('timestamp', inplace=True)
+        all_data.sort_index(inplace=True)
+
         # Convert date strings to timestamps if provided
         start_timestamp = pd.Timestamp(start_date) if start_date else None
         end_timestamp = pd.Timestamp(end_date) if end_date else None
-        
-        # Process each symbol
-        for symbol in self.symbols:
-            if symbol not in self.data:
-                logger.warning(f"No data loaded for {symbol}, skipping")
-                continue
-            
-            df = self.data[symbol]
-            
-            # Filter by date range if provided
-            if start_timestamp:
-                # Convert index to timezone-naive for correct comparison
-                if df.index.tz is not None:
-                    df_index_naive = df.index.tz_localize(None)
-                    df = df[df_index_naive >= start_timestamp]
-                else:
-                    df = df[df.index >= start_timestamp]
-                    
-            if end_timestamp:
-                # Convert index to timezone-naive for correct comparison
-                if df.index.tz is not None:
-                    df_index_naive = df.index.tz_localize(None)
-                    df = df[df_index_naive <= end_timestamp]
-                else:
-                    df = df[df.index <= end_timestamp]
-            
-            # Generate signals using the strategy
-            signals = self.strategy.generate_signals(df, symbol)
-            
-            # Process signals in chronological order
-            for signal in sorted(signals, key=lambda s: s.timestamp):
-                timestamp = signal.timestamp
-                
-                if signal.signal_type == SignalType.ENTRY and symbol not in open_trades:
-                    # Entry signal
-                    entry_price = self._apply_slippage(signal.price, True)
-                    
-                    # Calculate position size (fixed percentage of capital)
-                    capital_percent = self.config.get('risk', {}).get('capital_percent', 95.0) / 100.0
-                    position_size = int((cash * capital_percent) / entry_price)
-                    if position_size > 0:
-                        # Calculate commission
-                        commission = self._calculate_commission(entry_price, position_size)
-                        
-                        # Create trade
-                        trade = Trade(
-                            symbol=symbol,
-                            entry_price=entry_price,
-                            entry_time=timestamp,
-                            quantity=position_size,
-                            take_profit=signal.take_profit_level,
-                            stop_loss=signal.stop_loss_level
-                        )
-                        
-                        # Update cash and add to open trades
-                        cash -= (entry_price * position_size + commission)
-                        open_trades[symbol] = trade
-                        
-                        logger.debug(f"Backtest: Entry for {symbol} at {entry_price:.2f}, Qty: {position_size}")
-                        
-                elif signal.signal_type == SignalType.EXIT and symbol in open_trades:
-                    # Exit signal
-                    exit_price = self._apply_slippage(signal.price, False)
-                    trade = open_trades[symbol]
-                    exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
-                    
-                    # Close trade
-                    trade_pnl = trade.close(exit_price, timestamp, exit_reason)
-                    
-                    # Update cash and remove from open trades
-                    cash += trade.quantity * exit_price - self._calculate_commission(exit_price, trade.quantity)
-                    self.trades.append(trade)
-                    del open_trades[symbol]
-                    
-                    logger.debug(f"Backtest: Exit for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
-                
-                # Calculate equity at this point
-                current_equity = cash
-                for sym, trade in open_trades.items():
-                    # For open trades, use price at current timestamp
-                    current_price = df.loc[df.index <= timestamp, 'close'][-1] if sym == symbol else \
-                                   self.data[sym].loc[self.data[sym].index <= timestamp, 'close'][-1]
-                    
-                    # Add unrealized P&L to equity
+
+        # Filter combined data by date range if provided
+        if start_timestamp:
+            all_data = all_data[all_data.index.normalize() >= start_timestamp.normalize()]
+        if end_timestamp:
+            all_data = all_data[all_data.index.normalize() <= end_timestamp.normalize()]
+
+        logger.info(f"Processing {len(all_data)} total data points across {len(self.symbols)} symbols.")
+
+        # Iterate through each timestamp in the combined data
+        processed_data_slices = {symbol: pd.DataFrame(columns=self.data[symbol].columns) for symbol in self.symbols}
+
+        for timestamp, group in all_data.groupby(level=0):
+            # Process signals for each symbol present at this timestamp
+            for symbol, candle in group.iterrows():
+                # Append current candle to the processed slice for this symbol
+                # Ensure candle is a DataFrame row before appending
+                candle_df_row = candle.to_frame().T
+                candle_df_row.index = pd.DatetimeIndex([timestamp]) # Set the index correctly
+                # Ensure columns match
+                candle_df_row = candle_df_row.reindex(columns=processed_data_slices[symbol].columns, fill_value=np.nan)
+
+                # Use concat instead of append
+                processed_data_slices[symbol] = pd.concat([processed_data_slices[symbol], candle_df_row])
+
+                # Generate signal using data up to current candle for this symbol
+                signal = self.strategy.process_candle(processed_data_slices[symbol], symbol)
+
+                if signal:
+                    logger.debug(f"Signal received at {timestamp} for {symbol}: {signal}")
+                    # --- Handle Entry Signal ---
+                    if signal.signal_type == SignalType.ENTRY and symbol not in open_trades:
+                        entry_price = self._apply_slippage(signal.price, True)
+
+                        # Calculate position size based on strategy logic and equity
+                        equity_at_entry = cash + sum(t.quantity * processed_data_slices[t.symbol]['close'].iloc[-1] for s, t in open_trades.items() if s != symbol) # Approx equity
+                        capital_percent = self.strategy.calculate_entry_quantity_percent(processed_data_slices[symbol])
+                        position_value = equity_at_entry * capital_percent
+                        position_size = int(position_value / entry_price) if entry_price > 0 else 0
+
+                        if position_size > 0:
+                            commission = self._calculate_commission(entry_price, position_size)
+                            cost = entry_price * position_size + commission
+
+                            if cost <= cash: # Check affordability
+                                # Get SL/TP levels from strategy's internal state for this entry
+                                pos_details = self.strategy.open_positions.get(symbol, {})
+                                stop_loss_level = pos_details.get('stop_loss', signal.stop_loss_level) # Use signal's SL as fallback
+                                take_profit1_level = pos_details.get('take_profit1')
+                                take_profit2_level = pos_details.get('take_profit2')
+
+                                trade = Trade(
+                                    symbol=symbol,
+                                    entry_price=entry_price,
+                                    entry_time=timestamp,
+                                    quantity=position_size,
+                                    stop_loss=stop_loss_level
+                                )
+                                trade.take_profit1 = take_profit1_level
+                                trade.take_profit2 = take_profit2_level
+
+                                cash -= cost
+                                open_trades[symbol] = trade
+
+                                # Update strategy's internal tracking AFTER trade is confirmed
+                                self.strategy.update_open_position(symbol, {
+                                    'entry_price': trade.entry_price,
+                                    'quantity': trade.quantity,
+                                    'initial_quantity': trade.initial_quantity,
+                                    'stop_loss': trade.stop_loss,
+                                    'take_profit1': trade.take_profit1,
+                                    'take_profit2': trade.take_profit2
+                                })
+
+                                logger.info(f"{timestamp} - ENTRY: {symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
+                            else:
+                                logger.warning(f"{timestamp} - ENTRY Skipped (Insufficient cash): {symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
+                                # Remove placeholder from strategy tracking if entry failed
+                                self.strategy.update_open_position(symbol, None)
+                        else:
+                            logger.warning(f"{timestamp} - ENTRY Skipped (Zero quantity): {symbol} @ {entry_price:.2f}")
+                            # Remove placeholder from strategy tracking if entry failed
+                            self.strategy.update_open_position(symbol, None)
+
+
+                    # --- Handle Exit Signal ---
+                    elif signal.signal_type == SignalType.EXIT and symbol in open_trades:
+                        trade = open_trades[symbol]
+                        exit_price = self._apply_slippage(signal.price, False)
+                        exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
+
+                        # Handle Partial Exit
+                        if signal.exit_reason == ExitReason.PARTIAL_TAKE_PROFIT:
+                            # Close 50% of the initial quantity
+                            close_quantity = trade.initial_quantity // 2
+                            if close_quantity > 0 and trade.quantity >= close_quantity:
+                                commission = self._calculate_commission(exit_price, close_quantity)
+                                proceeds = exit_price * close_quantity - commission
+                                partial_pnl = trade.partial_close(exit_price, timestamp, exit_reason, close_quantity)
+                                cash += proceeds
+                                logger.info(f"{timestamp} - PARTIAL EXIT: {symbol} Qty: {close_quantity} @ {exit_price:.2f}, PnL: {partial_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
+                                # Update strategy tracking with remaining quantity
+                                self.strategy.update_open_position(symbol, {
+                                    'entry_price': trade.entry_price,
+                                    'quantity': trade.quantity, # Remaining quantity
+                                    'initial_quantity': trade.initial_quantity,
+                                    'stop_loss': trade.stop_loss,
+                                    'take_profit1': trade.take_profit1, # Keep levels
+                                    'take_profit2': trade.take_profit2
+                                })
+                            else:
+                                logger.warning(f"{timestamp} - Partial exit skipped for {symbol}: Invalid quantity ({close_quantity}) or already partially closed?")
+
+                        # Handle Full Exit
+                        else:
+                            close_quantity = trade.quantity # Close remaining quantity
+                            commission = self._calculate_commission(exit_price, close_quantity)
+                            proceeds = exit_price * close_quantity - commission
+                            trade_pnl = trade.close(exit_price, timestamp, exit_reason) # Closes remaining quantity
+                            cash += proceeds
+                            self.trades.append(trade)
+                            del open_trades[symbol]
+                            # Update strategy tracking (position closed)
+                            self.strategy.update_open_position(symbol, None)
+                            logger.info(f"{timestamp} - FULL EXIT: {symbol} Qty: {close_quantity} @ {exit_price:.2f}, Reason: {exit_reason}, PnL: {trade_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
+
+
+            # --- Update Equity Curve ---
+            # Calculate equity at the end of the timestamp after processing all symbols
+            current_equity = cash
+            for sym, trade in open_trades.items():
+                # Use the last known close price for the symbol up to this timestamp
+                if sym in processed_data_slices and not processed_data_slices[sym].empty:
+                    current_price = processed_data_slices[sym]['close'].iloc[-1]
                     position_value = trade.quantity * current_price
                     current_equity += position_value
-                
-                # Record equity for equity curve
-                equity_curve.append({
-                    'timestamp': timestamp,
-                    'equity': current_equity
-                })
-                
-                # Calculate daily return if this is end of day
-                current_date = timestamp.date()
-                next_day = False
-                if len(equity_curve) > 1:
-                    last_date = equity_curve[-2]['timestamp'].date()
-                    next_day = current_date != last_date
-                
-                if next_day:
-                    # Find previous day's equity
-                    prev_day_equity = next(
-                        (point['equity'] for point in reversed(equity_curve[:-1]) 
-                         if point['timestamp'].date() < current_date), 
-                        self.starting_capital
-                    )
-                    
-                    daily_return = (current_equity - prev_day_equity) / prev_day_equity
-                    daily_returns.append({
-                        'date': current_date,
-                        'return': daily_return
-                    })
-        
+                else:
+                    # Handle case where symbol data might not be present at this exact timestamp (unlikely with daily)
+                    logger.warning(f"Missing price data for open trade {sym} at {timestamp}")
+
+
+            equity_curve.append({'timestamp': timestamp, 'equity': current_equity})
+
+            # Calculate daily return (return per bar in this case)
+            if len(equity_curve) > 1:
+                prev_equity = equity_curve[-2]['equity']
+                daily_ret = (current_equity - prev_equity) / prev_equity if prev_equity != 0 else 0
+                daily_returns.append({'date': timestamp.date(), 'return': daily_ret})
+
+
         # Close any remaining open trades at the end of the backtest
-        for symbol, trade in list(open_trades.items()):
-            last_price = self.data[symbol]['close'][-1]
-            exit_price = self._apply_slippage(last_price, False)
-            trade_pnl = trade.close(exit_price, self.data[symbol].index[-1], "END_OF_BACKTEST")
-            
-            # Update cash
-            cash += trade.quantity * exit_price - self._calculate_commission(exit_price, trade.quantity)
-            self.trades.append(trade)
-            
-            logger.info(f"Backtest: Closing remaining trade for {symbol} at {exit_price:.2f}, PnL: {trade_pnl:.2f}")
-        
+        if not all_data.empty:
+            last_timestamp = all_data.index[-1]
+            for symbol, trade in list(open_trades.items()):
+                 if symbol in processed_data_slices and not processed_data_slices[symbol].empty:
+                    last_price = processed_data_slices[symbol]['close'].iloc[-1]
+                    exit_price = self._apply_slippage(last_price, False)
+                    close_quantity = trade.quantity
+                    commission = self._calculate_commission(exit_price, close_quantity)
+                    proceeds = exit_price * close_quantity - commission
+                    trade_pnl = trade.close(exit_price, last_timestamp, "END_OF_BACKTEST")
+                    cash += proceeds
+                    self.trades.append(trade)
+                    logger.info(f"End of Backtest - Closing {symbol} Qty: {close_quantity} @ {exit_price:.2f}, PnL: {trade_pnl:.2f}, Cash: {cash:.2f}")
+                 else:
+                     logger.warning(f"Could not close remaining trade for {symbol} at end of backtest - missing data.")
+
+
         # Convert equity curve and daily returns to DataFrames
         if equity_curve:
             self.equity_curve = pd.DataFrame(equity_curve).set_index('timestamp')
@@ -809,20 +931,20 @@ class Backtester:
         output_path.mkdir(parents=True, exist_ok=True)
         
         # Generate timestamp for filenames
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Save trades to CSV
-        trades_file = output_path / f"trades_{timestamp}.csv"
+        trades_file = output_path / f"trades_{timestamp_str}.csv"
         trades_data = [trade.to_dict() for trade in self.trades]
         trades_df = pd.DataFrame(trades_data)
         trades_df.to_csv(trades_file, index=False)
         
         # Save equity curve to CSV
-        equity_file = output_path / f"equity_{timestamp}.csv"
+        equity_file = output_path / f"equity_{timestamp_str}.csv"
         self.equity_curve.to_csv(equity_file)
         
         # Save metrics to JSON
-        metrics_file = output_path / f"metrics_{timestamp}.json"
+        metrics_file = output_path / f"metrics_{timestamp_str}.json"
         with open(metrics_file, 'w') as f:
             json.dump(self.metrics, f, indent=4)
         
@@ -831,16 +953,16 @@ class Backtester:
         plots_dir.mkdir(exist_ok=True)
         
         # Equity curve plot
-        equity_plot_file = plots_dir / f"equity_curve_{timestamp}.png"
+        equity_plot_file = plots_dir / f"equity_curve_{timestamp_str}.png"
         self._plot_equity_curve(equity_plot_file)
         
         # Drawdown plot
-        drawdown_plot_file = plots_dir / f"drawdown_{timestamp}.png"
+        drawdown_plot_file = plots_dir / f"drawdown_{timestamp_str}.png"
         self._plot_drawdown(drawdown_plot_file)
         
         # Generate HTML report
-        report_file = output_path / f"report_{timestamp}.html"
-        self._generate_html_report(report_file)
+        report_file = output_path / f"report_{timestamp_str}.html"
+        self._generate_html_report(report_file, timestamp_str) # Pass timestamp for plot paths
         
         logger.info(f"Backtest results saved to {output_path}")
         
@@ -893,28 +1015,32 @@ class Backtester:
     @property
     def strategy_params(self) -> Dict[str, Any]:
         """Get the strategy parameters for reporting."""
-        if isinstance(self.strategy, GaussianChannelStrategy):
+        if isinstance(self.strategy, SwingProStrategy):
             return {
-                'gc_period': self.strategy.gc_period,
-                'gc_multiplier': self.strategy.gc_multiplier,
-                'gc_poles': self.strategy.gc_poles,
-                'stoch_rsi_length': self.strategy.stoch_rsi_length,
-                'stoch_length': self.strategy.stoch_length,
-                'stoch_k_smooth': self.strategy.stoch_k_smooth,
-                'stoch_upper_band': self.strategy.stoch_upper_band,
-                'use_volume_filter': self.strategy.use_volume_filter,
-                'vol_ma_length': self.strategy.vol_ma_length,
-                'use_take_profit': self.strategy.use_take_profit,
-                'atr_tp_multiplier': self.strategy.atr_tp_multiplier
+                'risk_mult_atr_sl': self.strategy.risk_mult_atr_sl,
+                'risk_mult_atr_tp1': self.strategy.risk_mult_atr_tp1,
+                'risk_mult_atr_tp2': self.strategy.risk_mult_atr_tp2,
+                'trail_ema_len': self.strategy.trail_ema_len,
+                'ema_50_len': self.strategy.ema_50_len,
+                'ema_200_len': self.strategy.ema_200_len,
+                'rsi_len': self.strategy.rsi_len,
+                'rsi_ob_level': self.strategy.rsi_ob_level,
+                'macd_fast': self.strategy.macd_fast,
+                'macd_slow': self.strategy.macd_slow,
+                'macd_signal': self.strategy.macd_signal,
+                'atr_len': self.strategy.atr_len,
+                'use_mtf_trend': self.strategy.use_mtf_trend,
+                'daily_ema_len': self.strategy.daily_ema_len
             }
         return {}
         
-    def _generate_html_report(self, filename: str) -> None:
+    def _generate_html_report(self, filename: str, timestamp_str: str) -> None:
         """
         Generate HTML backtest report.
         
         Args:
             filename: File to save the report
+            timestamp_str: Timestamp string used for plot filenames
         """
         # Format metrics for display
         metrics_html = ""
@@ -934,16 +1060,18 @@ class Backtester:
             trades_html += f"<td>{trade_dict['symbol']}</td>"
             trades_html += f"<td>{trade_dict['entry_time']}</td>"
             trades_html += f"<td>{trade_dict['entry_price']:.2f}</td>"
+            trades_html += f"<td>{trade_dict['initial_quantity']}</td>" # Show initial quantity
             if not trade.is_open:
                 trades_html += f"<td>{trade_dict['exit_time']}</td>"
                 trades_html += f"<td>{trade_dict['exit_price']:.2f}</td>"
                 trades_html += f"<td>{trade_dict['exit_reason']}</td>"
                 # Color code PnL
-                pnl_class = "positive" if trade.pnl > 0 else "negative"
+                pnl_class = "positive" if trade.pnl > 0 else ("negative" if trade.pnl < 0 else "neutral")
                 trades_html += f"<td class='{pnl_class}'>{trade_dict['pnl']:.2f}</td>"
                 trades_html += f"<td class='{pnl_class}'>{trade_dict['pnl_percent']:.2f}%</td>"
             else:
-                trades_html += "<td colspan='5'>Trade still open</td>"
+                # Should not happen if backtest closes all trades
+                trades_html += "<td colspan='5'>Trade still open?</td>"
             trades_html += "</tr>"
         
         # Create HTML template
@@ -961,6 +1089,7 @@ class Backtester:
                 tr:nth-child(even) {{ background-color: #f9f9f9; }}
                 .positive {{ color: green; }}
                 .negative {{ color: red; }}
+                .neutral {{ color: black; }}
                 .report-section {{ margin-bottom: 30px; }}
                 .images {{ display: flex; justify-content: space-between; margin-bottom: 20px; }}
                 .images img {{ width: 48%; }}
@@ -988,8 +1117,8 @@ class Backtester:
             <div class="report-section">
                 <h2>Performance Charts</h2>
                 <div class="images">
-                    <img src="plots/equity_curve_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png" alt="Equity Curve">
-                    <img src="plots/drawdown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png" alt="Drawdown">
+                    <img src="plots/equity_curve_{timestamp_str}.png" alt="Equity Curve">
+                    <img src="plots/drawdown_{timestamp_str}.png" alt="Drawdown">
                 </div>
             </div>
             
@@ -1001,6 +1130,7 @@ class Backtester:
                         <th>Symbol</th>
                         <th>Entry Time</th>
                         <th>Entry Price</th>
+                        <th>Initial Qty</th>
                         <th>Exit Time</th>
                         <th>Exit Price</th>
                         <th>Exit Reason</th>

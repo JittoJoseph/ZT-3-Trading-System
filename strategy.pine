@@ -1,200 +1,68 @@
 //@version=6
-// --- START OF STRATEGY HEADER ---
-// Strategy Name: Demo GPT - Gaussian Channel Strategy v3.13 + Stoch RSI(14,14,3) + Vol + TP (GC Mult 1.2)
-// Strategy Title: Demo GPT - Gaussian Channel Strategy v3.13 + Stoch RSI(14,14,3) + Vol + TP (GC Mult 1.2)
-// Integration and Modification: Per user request + Enhancements v3.13
-// Description: TSL disabled. TP 4.0x ATR. GC Period 144. Stoch RSI(14,14,3). GC Multiplier changed to 1.2.
-//              Enters long: GC green, close > hband(mult=1.2), Stoch RSI(14,14,3) > 80, volume > MA.
-//              Exits long: Take Profit hit OR close crosses below GC filter line.
-//              Long-only, approximated realistic commissions.
-// --- END OF STRATEGY HEADER ---
+strategy("SwingPro v7 – Adaptive Signal Sizer", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=2500)
 
-// === STRATEGY SETTINGS ===
-strategy(title="Demo GPT - Gaussian Channel Strategy v3.13 + Stoch RSI(14,14,3) + Vol + TP (GC Mult 1.2)", // Updated Title
-     overlay=true,
-     calc_on_every_tick=false,
-     initial_capital=2500,
-     default_qty_type=strategy.percent_of_equity,
-     default_qty_value=100,
-     commission_type=strategy.commission.percent,
-     commission_value=0.03,
-     slippage=0,
-     fill_orders_on_standard_ohlc=true)
+// === INPUTS ===
+risk_mult_atr_sl = input.float(1.5, "ATR x SL", step=0.1)
+risk_mult_atr_tp1 = input.float(3.0, "ATR x TP1 (Partial)", step=0.1)
+risk_mult_atr_tp2 = input.float(4.0, "ATR x TP2 (Final)", step=0.1)
+trail_ema_len = input.int(20, "Trailing EMA for Exit")
+use_mtf_trend = input.bool(true, "Use Daily EMA Filter?")
+daily_ema_len = input.int(50, "Daily EMA Length")
 
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Date Filtering Inputs
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-startDate = input.time(timestamp("1 January 2018 00:00 +0000"), "Start Date", group="Date Range")
-endDate = input.time(timestamp("31 Dec 2069 23:59 +0000"), "End Date", group="Date Range")
-timeCondition = time >= startDate and time <= endDate
+// === INDICATORS ===
+ema_1h = ta.ema(close, trail_ema_len)
+ema_50 = ta.ema(close, 50)
+ema_200 = ta.ema(close, 200)
+rsi = ta.rsi(close, 14)
+macd_line = ta.ema(close, 12) - ta.ema(close, 26)
+macd_signal = ta.ema(macd_line, 9)
+macd_hist = macd_line - macd_signal
+macd_positive = macd_line > macd_signal
+rsi_not_overbought = rsi < 70
+atr = ta.atr(14)
 
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Gaussian Channel Indicator - courtesy of @DonovanWall & @e2e4mfck
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-gc_group = "Gaussian Channel Settings"
+// === MULTI-TIMEFRAME TREND FILTER ===
+htf_close = request.security(syminfo.tickerid, "D", close)
+daily_ema = ta.ema(htf_close, daily_ema_len)
+in_uptrend_mtf = close > daily_ema
+trend_filter = use_mtf_trend ? in_uptrend_mtf : true
 
-// Filter function (f_filt9x and f_pole remain unchanged)
-f_filt9x (_a, _s, _i) =>
-    int _m2 = 0, int _m3 = 0, int _m4 = 0, int _m5 = 0, int _m6 = 0,
-    int _m7 = 0, int _m8 = 0, int _m9 = 0, float _f = .0, _x = (1 - _a)
-    _m2 := _i == 9 ? 36  : _i == 8 ? 28 : _i == 7 ? 21 : _i == 6 ? 15 : _i == 5 ? 10 : _i == 4 ? 6 : _i == 3 ? 3 : _i == 2 ? 1 : 0
-    _m3 := _i == 9 ? 84  : _i == 8 ? 56 : _i == 7 ? 35 : _i == 6 ? 20 : _i == 5 ? 10 : _i == 4 ? 4 : _i == 3 ? 1 : 0
-    _m4 := _i == 9 ? 126 : _i == 8 ? 70 : _i == 7 ? 35 : _i == 6 ? 15 : _i == 5 ? 5  : _i == 4 ? 1 : 0
-    _m5 := _i == 9 ? 126 : _i == 8 ? 56 : _i == 7 ? 21 : _i == 6 ? 6  : _i == 5 ? 1  : 0
-    _m6 := _i == 9 ? 84  : _i == 8 ? 28 : _i == 7 ? 7  : _i == 6 ? 1  : 0
-    _m7 := _i == 9 ? 36  : _i == 8 ? 8  : _i == 7 ? 1  : 0
-    _m8 := _i == 9 ? 9   : _i == 8 ? 1  : 0
-    _m9 := _i == 9 ? 1   : 0
-    _f :=   math.pow(_a, _i) * nz(_s) +
-      _i  *     _x      * nz(_f[1])      - (_i >= 2 ?
-      _m2 * math.pow(_x, 2)  * nz(_f[2]) : 0) + (_i >= 3 ?
-      _m3 * math.pow(_x, 3)  * nz(_f[3]) : 0) - (_i >= 4 ?
-      _m4 * math.pow(_x, 4)  * nz(_f[4]) : 0) + (_i >= 5 ?
-      _m5 * math.pow(_x, 5)  * nz(_f[5]) : 0) - (_i >= 6 ?
-      _m6 * math.pow(_x, 6)  * nz(_f[6]) : 0) + (_i >= 7 ?
-      _m7 * math.pow(_x, 7)  * nz(_f[7]) : 0) - (_i >= 8 ?
-      _m8 * math.pow(_x, 8)  * nz(_f[8]) : 0) + (_i == 9 ?
-      _m9 * math.pow(_x, 9)  * nz(_f[9]) : 0)
-    _f // return _f implicitly
-f_pole (_a, _s, _i) =>
-    _f1 =            f_filt9x(_a, _s, 1),      _f2 = (_i >= 2 ? f_filt9x(_a, _s, 2) : 0), _f3 = (_i >= 3 ? f_filt9x(_a, _s, 3) : 0)
-    _f4 = (_i >= 4 ? f_filt9x(_a, _s, 4) : 0), _f5 = (_i >= 5 ? f_filt9x(_a, _s, 5) : 0), _f6 = (_i >= 6 ? f_filt9x(_a, _s, 6) : 0)
-    _f7 = (_i >= 7 ? f_filt9x(_a, _s, 7) : 0), _f8 = (_i >= 8 ? f_filt9x(_a, _s, 8) : 0), _f9 = (_i == 9 ? f_filt9x(_a, _s, 9) : 0)
-    _fn = _i == 1 ? _f1 : _i == 2 ? _f2 : _i == 3 ? _f3 :
-      _i == 4     ? _f4 : _i == 5 ? _f5 : _i == 6 ? _f6 :
-      _i == 7     ? _f7 : _i == 8 ? _f8 : _i == 9 ? _f9 : na
-    [_fn, _f1]
+// === SIGNAL STRENGTH MULTIPLIER ===
+macd_strength = math.abs(macd_hist)
+rsi_strength = math.max(0, 70 - rsi) / 70
+signal_strength = math.min(1.0, macd_strength + rsi_strength)
+position_percent = 0.8 + (signal_strength * 0.2)  // Scales from 0.8 to 1.0
 
-// Gaussian Channel Inputs
-src_gc = input(defval=hlc3, title="GC Source", group=gc_group)
-int N = input.int(defval=4, title="GC Poles", minval=1, maxval=9, group=gc_group)
-int per = input.int(defval=144, title="GC Sampling Period", minval=2, group=gc_group) // Kept at 144
-float mult = input.float(defval=1.2, title="GC Filtered True Range Multiplier", minval=0, group=gc_group) // <<< CHANGED to 1.2
-bool modeLag  = input.bool(defval=false, title="GC Reduced Lag Mode", group=gc_group)
-bool modeFast = input.bool(defval=false, title="GC Fast Response Mode", group=gc_group)
+// === DYNAMIC QTY CALCULATION ===
+capital = strategy.equity
+buy_qty = math.floor((capital * position_percent) / close)
 
-// Gaussian Channel Definitions (will now use mult=1.2)
-beta  = (1 - math.cos(4*math.asin(1)/per)) / (math.pow(1.414, 2/N) - 1)
-alpha = - beta + math.sqrt(math.pow(beta, 2) + 2*beta)
-lag = (per - 1)/(2*N)
-srcdata = modeLag ? src_gc + (src_gc - src_gc[lag]) : src_gc
-trdata  = modeLag ? ta.tr(true) + (ta.tr(true) - ta.tr(true)[lag]) : ta.tr(true)
-[filtn, filt1]     = f_pole(alpha, srcdata, N)
-[filtntr, filt1tr] = f_pole(alpha, trdata,  N)
-filt   = modeFast ? (filtn + filt1)/2 : filtn
-filttr = modeFast ? (filtntr + filt1tr)/2 : filtntr
-hband = filt + filttr*mult // Uses mult=1.2
-lband = filt - filttr*mult // Uses mult=1.2
+// === ENTRY CONDITIONS ===
+entryCondition = macd_positive and rsi_not_overbought and trend_filter
 
-// Gaussian Channel Colors and Plots
-color1   = #0aff68
-color2   = #00752d
-color3   = #ff0a5a
-color4   = #990032
-fcolor   = filt > filt[1] ? color1 : filt < filt[1] ? color3 : #cccccc
-barcolor_gc = (src_gc > src_gc[1]) and (src_gc > filt) and (src_gc < hband) ? color1 : (src_gc > src_gc[1]) and (src_gc >= hband) ? #0aff1b : (src_gc <= src_gc[1]) and (src_gc > filt) ? color2 :
-           (src_gc < src_gc[1]) and (src_gc < filt) and (src_gc > lband) ? color3 : (src_gc < src_gc[1]) and (src_gc <= lband) ? #ff0a11 : (src_gc >= src_gc[1]) and (src_gc < filt) ? color4 : #cccccc
-filtplot = plot(filt, title="Filter", color=fcolor, linewidth=3)
-hbandplot = plot(hband, title="Filtered True Range High Band", color=fcolor)
-lbandplot = plot(lband, title="Filtered True Range Low Band", color=fcolor)
-fill(hbandplot, lbandplot, title="Channel Fill", color=color.new(fcolor, 80))
-barcolor(barcolor_gc)
+if (entryCondition)
+    strategy.entry("Long", strategy.long, qty=buy_qty)
 
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Stochastic RSI Calculation
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-stoch_group = "Stochastic RSI Settings"
-smoothK = input.int(3, "Stoch K Smooth", minval=1, group=stoch_group) // <<< REVERTED to 3
-smoothD = input.int(3, "Stoch D Smooth", minval=1, group=stoch_group)
-lengthRSI = input.int(14, "RSI Length", minval=1, group=stoch_group) // Kept at 14
-lengthStoch = input.int(14, "Stochastic Length", minval=1, group=stoch_group) // Kept at 14
-src_stochrsi = input(close, title="Stoch RSI Source", group=stoch_group)
-rsi1 = ta.rsi(src_stochrsi, lengthRSI)
-k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK) // K line uses smoothK=3
-stochUpperBand = 80.0
+// === ATR-BASED TP/SL ===
+takeLevel1 = strategy.position_avg_price + atr * risk_mult_atr_tp1
+takeLevel2 = strategy.position_avg_price + atr * risk_mult_atr_tp2
+stopLevel = strategy.position_avg_price - atr * risk_mult_atr_sl
 
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Additional Filters
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-filter_group = "Additional Filters"
-useVolumeFilter = input.bool(true, "Use Volume Filter", group=filter_group)
-volMALength = input.int(20, "Volume MA Length", minval=1, group=filter_group)
-volMA = ta.sma(volume, volMALength)
-volumeCondition = not useVolumeFilter or (volume > volMA)
+// === EXIT CONDITIONS ===
+exitByTP1 = close >= takeLevel1
+exitByTP2 = close >= takeLevel2
+exitBySL = close <= stopLevel
+exitByEMA = close < ema_1h
 
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Trailing Stop Loss & Take Profit Settings and Calculation
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-exit_group = "Exit Settings"
-// TSL (Disabled)
-useTrailingStop = input.bool(false, "Use ATR Trailing Stop", group=exit_group)
-atrLength = input.int(14, "ATR Length (for TSL & TP)", minval=1, group=exit_group)
-atrMultiplierTSL = input.float(2.0, "ATR Multiplier (Trailing Stop)", minval=0.1, step=0.1, group=exit_group)
-// TP
-useTakeProfit = input.bool(true, "Use ATR Take Profit", group=exit_group)
-atrMultiplierTP = input.float(4.0, "ATR Multiplier (Take Profit)", minval=0.1, step=0.1, group=exit_group) // Kept at 4.0x
+// === PARTIAL + FULL EXIT ===
+if (exitByTP1)
+    strategy.close("Long", qty_percent=50)
+if (exitByTP2 or exitBySL or exitByEMA)
+    strategy.close("Long")
 
-atrValue = ta.atr(atrLength)
-
-// Variables to store exit levels
-var float trailStopPrice = na
-var float takeProfitLevel = na
-
-// Update TSL only if in a position AND enabled
-if strategy.position_size > 0 and useTrailingStop
-    newStop = filt - atrValue * atrMultiplierTSL
-    trailStopPrice := na(trailStopPrice[1]) or strategy.position_size[1] == 0 ? newStop : math.max(newStop, trailStopPrice[1])
-else
-    trailStopPrice := na
-
-// Plot TSL only if enabled
-plot(strategy.position_size > 0 and useTrailingStop ? trailStopPrice : na, "Trail Stop", color.orange, style=plot.style_linebr)
-// Plot TP
-plot(strategy.position_size > 0 and useTakeProfit ? takeProfitLevel : na, "Take Profit", color.green, style=plot.style_linebr)
-
-
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-// Trading Logic (Improved based on requirements V3.13)
-//-----------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-// Entry Condition (GC hband uses mult=1.2)
-longEntryCondition = (filt > filt[1]) and (close > hband) and (k > stochUpperBand) and volumeCondition and timeCondition
-
-// Calculate potential Take Profit Level dynamically
-if strategy.position_size > 0 and na(takeProfitLevel) // Only set it once per trade
-    atrEntry = na(atrValue[1]) ? atrValue : atrValue[1]
-    takeProfitLevel := strategy.position_avg_price + atrEntry * atrMultiplierTP
-
-// Exit Conditions (Filter cross uses GC period 144)
-takeProfitExit = useTakeProfit and strategy.position_size > 0 and not na(takeProfitLevel) and high >= takeProfitLevel and timeCondition
-trailStopExit = useTrailingStop and strategy.position_size > 0 and not na(trailStopPrice) and low <= trailStopPrice and timeCondition // Inactive
-filterCrossExit = ta.crossunder(close, filt) and timeCondition
-
-// Strategy Execution
-if (longEntryCondition and strategy.position_size == 0)
-    strategy.entry("Long", strategy.long)
-    // Reset levels
-    trailStopPrice := na
-    takeProfitLevel := na
-
-// Exit Execution
-if strategy.position_size > 0
-    if takeProfitExit
-        strategy.close("Long", comment = "TP Exit")
-        trailStopPrice := na
-        takeProfitLevel := na
-    else if trailStopExit // Inactive path
-        strategy.close("Long", comment = "TSL Exit")
-        trailStopPrice := na
-        takeProfitLevel := na
-    else if filterCrossExit // Active exit path
-        strategy.close("Long", comment="Filt Cross Exit")
-        trailStopPrice := na
-        takeProfitLevel := na
-
-// Reset levels if position closed
-if strategy.position_size == 0 and strategy.position_size[1] > 0
-    takeProfitLevel := na
-    trailStopPrice := na
-
-// --- END OF SCRIPT ---
+// === PLOTS ===
+plot(ema_1h, color=color.orange, title="Trailing EMA")
+plot(ema_50, color=color.blue, title="EMA 50")
+plot(ema_200, color=color.red, title="EMA 200")
+hline(70, "RSI Overbought", color=color.gray)
+plotshape(entryCondition, color=color.green, style=shape.labelup, location=location.belowbar, text="Entry")

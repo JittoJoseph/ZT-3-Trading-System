@@ -30,6 +30,8 @@ from backtest.backtester import Backtester
 from config.loader import ConfigLoader
 from utils.logger import setup_logging
 from utils.notifications import NotificationManager
+# Import the new strategy class if needed for type hinting or direct use (though backtester loads it)
+from strategy.swing_pro import SwingProStrategy
 
 # Load environment variables from .env file
 load_dotenv()
@@ -50,11 +52,11 @@ def parse_arguments():
         help='Configuration file name within config directory'
     )
     
-    # Date range
+    # Date range - Adjust defaults for daily data (e.g., 2 years)
     parser.add_argument(
         '--start-date', '-s',
-        default=(datetime.now().replace(day=1) - pd.DateOffset(months=6)).strftime('%Y-%m-%d'),
-        help='Start date for backtest (YYYY-MM-DD), default: 6 months ago'
+        default=(datetime.now() - pd.DateOffset(years=2)).strftime('%Y-%m-%d'),
+        help='Start date for backtest (YYYY-MM-DD), default: 2 years ago'
     )
     
     parser.add_argument(
@@ -90,9 +92,7 @@ def parse_arguments():
         default='INFO',
         help='Logging level'
     )
-    
-    # Removed the interval parameter - always use 30minute
-    
+
     return parser.parse_args()
 
 def main():
@@ -147,7 +147,7 @@ def main():
                 for symbol in backtester.symbols:
                     csv_paths[symbol] = args.csv_path
         
-        logger.info(f"Using {args.data_source} as data source with 30minute interval")
+        logger.info(f"Using {args.data_source} as data source with 'day' interval")
         logger.info(f"Date range: {args.start_date} to {args.end_date}")
         
         # Setup notification for backtest start
@@ -170,7 +170,6 @@ def main():
                     start_date=args.start_date,
                     end_date=args.end_date,
                     source=args.data_source,
-                    interval='30minute',  # Always use 30minute
                     csv_path=csv_path
                 )
                 logger.info(f"Loaded data for {symbol}")

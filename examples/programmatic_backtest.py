@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from backtest.backtester import Backtester
 from config.loader import ConfigLoader
 from utils.logger import setup_logging
-from strategy.gaussian_channel import GaussianChannelStrategy
+from strategy.swing_pro import SwingProStrategy
 
 # Load environment variables
 load_dotenv()
@@ -50,10 +50,9 @@ def run_parameter_optimization():
     config_loader = ConfigLoader()
     base_config = config_loader.load_config('default_config.yaml')
     
-    # Use reasonable date range for backtesting
-    # Default to past 6 months of data
+    # Use reasonable date range for backtesting (e.g., 2 years for daily)
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=180)
+    start_date = end_date - timedelta(days=365*2)
     
     # Convert to string format
     end_date_str = end_date.strftime('%Y-%m-%d')
@@ -69,14 +68,18 @@ def run_parameter_optimization():
         backtester = Backtester(base_config)
         
         # Get the strategy instance directly
+        if not isinstance(backtester.strategy, SwingProStrategy):
+             print("Error: Loaded strategy is not SwingProStrategy")
+             return None
         strategy = backtester.strategy
-        
-        # Output the current parameter values
+
+        # Output the current parameter values (Update for SwingPro)
         print(f"Current Parameters:")
-        print(f"GC Period: {strategy.gc_period}")
-        print(f"GC Multiplier: {strategy.gc_multiplier}")
-        print(f"Stoch Upper Band: {strategy.stoch_upper_band}")
-        print(f"ATR TP Multiplier: {strategy.atr_tp_multiplier}")
+        print(f"  ATR SL Mult: {strategy.risk_mult_atr_sl}")
+        print(f"  ATR TP1 Mult: {strategy.risk_mult_atr_tp1}")
+        print(f"  ATR TP2 Mult: {strategy.risk_mult_atr_tp2}")
+        print(f"  Trail EMA Len: {strategy.trail_ema_len}")
+        # Add other relevant params if needed
         
         # Load data for each symbol
         for symbol in symbols:
@@ -86,7 +89,7 @@ def run_parameter_optimization():
                     start_date=start_date_str,
                     end_date=end_date_str,
                     source='api',  # Use API to get real data
-                    interval='5minute'  # Upstox API format
+                    # interval='day'  # Removed, now hardcoded in backtester.load_data
                 )
                 print(f"Data loaded for {symbol}")
             except Exception as e:
