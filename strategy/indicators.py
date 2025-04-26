@@ -163,3 +163,62 @@ class Indicators:
         ema_col_name = f'ema_{period}'
         result[ema_col_name] = result[source_col].ewm(span=period, adjust=False).mean()
         return result
+
+    @staticmethod
+    def sma(df: pd.DataFrame, source_col: str = 'close', period: int = 20) -> pd.DataFrame:
+        """
+        Calculate Simple Moving Average (SMA).
+
+        Args:
+            df: DataFrame with price data
+            source_col: Column name to use as source data
+            period: Period for the SMA
+
+        Returns:
+            DataFrame with added column: sma_<source>_<period>
+        """
+        if len(df) < period:
+            logger.warning(f"Not enough data for SMA({period}) on {source_col} calculation")
+            return df.copy()
+
+        result = df.copy()
+        sma_col_name = f'sma_{source_col}_{period}' # Include source in name for clarity
+        result[sma_col_name] = result[source_col].rolling(window=period).mean()
+        return result
+
+    @staticmethod
+    def normalize_macd_hist(df: pd.DataFrame, hist_col: str = 'macd_hist', period: int = 50) -> pd.DataFrame:
+        """
+        Calculates a normalization factor for the MACD histogram based on its
+        rolling maximum absolute value over a specified period.
+
+        Args:
+            df: DataFrame with MACD histogram calculated (must contain hist_col).
+            hist_col: Column name of the MACD histogram.
+            period: The lookback period for finding the max absolute value.
+
+        Returns:
+            DataFrame with added column: macd_hist_norm_factor
+        """
+        if hist_col not in df.columns:
+            logger.error(f"MACD Histogram column '{hist_col}' not found for normalization.")
+            return df.copy()
+        if len(df) < period:
+            logger.warning(f"Not enough data for MACD Hist normalization ({len(df)} < {period}). Factor will be NaN initially.")
+            # Avoid returning early, let rolling handle initial NaNs
+
+        result = df.copy()
+        norm_factor_col = f'{hist_col}_norm_factor'
+
+        # Calculate the rolling maximum of the *absolute* histogram value
+        rolling_max_abs_hist = result[hist_col].abs().rolling(window=period, min_periods=1).max()
+
+        # Set the normalization factor. Replace 0 with 1 to avoid division by zero.
+        # Use a small epsilon instead of 1? Let's stick with 1 for simplicity.
+        result[norm_factor_col] = rolling_max_abs_hist.replace(0, 1)
+
+        # Forward fill initial NaNs that rolling max might produce if min_periods > 1 was used
+        # result[norm_factor_col] = result[norm_factor_col].ffill() # Not needed with min_periods=1
+
+        logger.debug(f"Calculated MACD Hist normalization factor over {period} periods.")
+        return result

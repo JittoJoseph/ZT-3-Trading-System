@@ -45,7 +45,10 @@ class Signal:
                 timestamp: pd.Timestamp,
                 take_profit_level: Optional[float] = None,
                 stop_loss_level: Optional[float] = None,
-                exit_reason: Optional[ExitReason] = None):
+                exit_reason: Optional[ExitReason] = None,
+                rsi_value: Optional[float] = None, # Added rsi_value
+                close_quantity: Optional[int] = None): # Added close_quantity
+                # Removed initial_trail_stop parameter
         """
         Initialize a new signal.
         
@@ -57,6 +60,8 @@ class Signal:
             take_profit_level: Optional take profit level
             stop_loss_level: Optional stop loss level
             exit_reason: Reason for exit signals
+            rsi_value: RSI value at the time of signal generation (for ranking)
+            close_quantity: Quantity to close (for partial exits)
         """
         self.signal_type = signal_type
         self.symbol = symbol
@@ -65,6 +70,9 @@ class Signal:
         self.take_profit_level = take_profit_level
         self.stop_loss_level = stop_loss_level
         self.exit_reason = exit_reason
+        self.rsi_value = rsi_value # Added
+        self.close_quantity = close_quantity # Added
+        # self.initial_trail_stop = initial_trail_stop # Removed
         self.id = f"{symbol}_{signal_type.value}_{timestamp.strftime('%Y%m%d%H%M%S')}"
     
     def __str__(self) -> str:
@@ -80,6 +88,14 @@ class Signal:
         if self.exit_reason:
             signal_str += f", Reason: {self.exit_reason.value}"
             
+        if self.rsi_value is not None: # Added
+             signal_str += f", RSI: {self.rsi_value:.2f}" # Added
+            
+        if self.close_quantity is not None: # Added
+            signal_str += f", Close Qty: {self.close_quantity}" # Added
+
+        # Removed initial_trail_stop formatting
+
         return signal_str
     
     def to_dict(self) -> Dict[str, Any]:
@@ -92,7 +108,10 @@ class Signal:
             "timestamp": self.timestamp.isoformat(),
             "take_profit_level": self.take_profit_level,
             "stop_loss_level": self.stop_loss_level,
-            "exit_reason": self.exit_reason.value if self.exit_reason else None
+            "exit_reason": self.exit_reason.value if self.exit_reason else None,
+            "rsi_value": self.rsi_value, # Added
+            "close_quantity": self.close_quantity, # Added
+            # Removed "initial_trail_stop": self.initial_trail_stop
         }
 
 class Strategy:

@@ -39,8 +39,7 @@ class Trade:
                 entry_price: float, 
                 entry_time: datetime,
                 quantity: int,
-                take_profit: Optional[float] = None,
-                stop_loss: Optional[float] = None):
+                initial_stop_loss: Optional[float] = None):
         """
         Initialize a new trade.
         
@@ -49,15 +48,13 @@ class Trade:
             entry_price: Entry price
             entry_time: Entry timestamp
             quantity: Number of shares/contracts
-            take_profit: Optional take profit level
-            stop_loss: Optional stop loss level
+            initial_stop_loss: Optional initial stop loss level (reference only)
         """
         self.symbol = symbol
         self.entry_price = entry_price
         self.entry_time = entry_time
         self.quantity = quantity
-        self.take_profit = take_profit
-        self.stop_loss = stop_loss
+        self.stop_loss = initial_stop_loss # Store initial SL for reference
         
         # Add TP levels specific to SwingPro
         self.take_profit1 = None # For partial exit
@@ -154,7 +151,6 @@ class Trade:
             "entry_time": self.entry_time.strftime("%Y-%m-%d %H:%M:%S"),
             "quantity": self.quantity, # Current open quantity
             "initial_quantity": self.initial_quantity, # Added
-            "take_profit": self.take_profit, # Keep for compatibility? Or remove? Let's keep.
             "take_profit1": self.take_profit1, # Added
             "take_profit2": self.take_profit2, # Added
             "stop_loss": self.stop_loss,
@@ -197,6 +193,8 @@ class Backtester:
         self.starting_capital = float(config.get('backtest', {}).get('starting_capital', 3000.0))
         self.commission_percent = float(config.get('backtest', {}).get('commission_percent', 0.03))
         self.slippage_percent = float(config.get('backtest', {}).get('slippage_percent', 0.1))
+        # Add max concurrent positions limit
+        self.max_concurrent_positions = int(config.get('backtest', {}).get('max_concurrent_positions', 999)) # Default to a high number if not set
         
         # Store historical data and trades
         self.data = {}  # {symbol: DataFrame}
@@ -206,8 +204,8 @@ class Backtester:
         # Performance metrics (to be calculated after backtest)
         self.metrics = {}
         
-        # Strategy instance
-        self.strategy = self._load_strategy()
+        # Strategy instance - Pass max_concurrent_positions here
+        self.strategy = self._load_strategy(self.max_concurrent_positions)
         
         # API client for accessing historical data
         self.api_key = os.environ.get('UPSTOX_API_KEY') or config.get('api', {}).get('api_key')
@@ -226,13 +224,16 @@ class Backtester:
             logger.warning("NotificationManager not available. Discord notifications will be disabled.")
             self.notification_manager = None
         
-        logger.info(f"Backtester initialized for {self.strategy_name} with {len(self.symbols)} symbols")
+        logger.info(f"Backtester initialized for {self.strategy_name} with {len(self.symbols)} symbols. Max concurrent positions: {self.max_concurrent_positions}")
         # Reset strategy state at the beginning of each backtest run
         self.strategy.reset_position_tracking()
     
-    def _load_strategy(self):
+    def _load_strategy(self, max_concurrent_positions: int):
         """
         Load the strategy class based on the configuration.
+        
+        Args:
+            max_concurrent_positions: The maximum number of concurrent positions allowed.
         
         Returns:
             Strategy instance
@@ -241,12 +242,12 @@ class Backtester:
             # Currently we only support SwingProStrategy
             # In the future this could be more dynamic based on strategy_name
             if self.strategy_name == 'SwingProStrategy':
-                 return SwingProStrategy(self.config)
+                 return SwingProStrategy(self.config, max_concurrent_positions)
             else:
                  # Fallback or error for unknown strategy
                  # For now, assume SwingPro
                  logger.warning(f"Unknown strategy '{self.strategy_name}', loading SwingProStrategy.")
-                 return SwingProStrategy(self.config)
+                 return SwingProStrategy(self.config, max_concurrent_positions)
 
         except Exception as e:
             logger.error(f"Failed to load strategy {self.strategy_name}: {e}")
@@ -660,28 +661,29 @@ class Backtester:
         except Exception as e:
             logger.warning(f"Failed to save API config: {e}")
 
-    def run_backtest(self, 
-                   start_date: Optional[str] = None, 
+    def run_backtest(self,
+                   start_date: Optional[str] = None,
                    end_date: Optional[str] = None) -> Dict[str, Any]:
         """
-        Run backtest on loaded data.
-        
+        Run backtest on loaded data, executing trades on the open of the bar AFTER the signal bar.
+
         Args:
             start_date: Optional start date to filter data (YYYY-MM-DD)
             end_date: Optional end date to filter data (YYYY-MM-DD)
-            
+
         Returns:
             Dictionary with backtest results
         """
-        logger.info(f"Starting backtest from {start_date} to {end_date}")
-        
+        logger.info(f"Starting backtest from {start_date} to {end_date} (Execution on Next Bar Open)")
+
         # Initialize backtest variables
         self.trades = []
         open_trades = {}  # symbol -> Trade
         cash = self.starting_capital
         equity = cash
         equity_curve = []
-        bar_returns = [] # Renamed from daily_returns
+        bar_returns = []
+        pending_signals = {} # {symbol: Signal} - Signals generated on previous bar's close
 
         # Reset strategy state before iterating data
         self.strategy.reset_position_tracking()
@@ -706,156 +708,201 @@ class Backtester:
 
         # Iterate through each timestamp in the combined data
         processed_data_slices = {symbol: pd.DataFrame(columns=self.data[symbol].columns) for symbol in self.symbols}
+        unique_timestamps = all_data.index.unique()
 
-        for timestamp, group in all_data.groupby(level=0):
-            # Process signals for each symbol present at this timestamp
-            # Corrected loop: idx is the timestamp index, candle is the row Series
+        for i, timestamp in enumerate(unique_timestamps):
+            group = all_data.loc[timestamp]
+            # Ensure group is DataFrame even if only one row at this timestamp
+            if isinstance(group, pd.Series):
+                group = group.to_frame().T
+
+            current_bar_open_prices = {} # Store open prices for execution
+
+            # --- First Pass: Execute Pending Signals from Previous Bar ---
+            potential_entries = []
+            potential_exits = []
+            symbols_with_pending_signals = list(pending_signals.keys())
+
+            # Separate pending signals into entries and exits
+            for symbol in symbols_with_pending_signals:
+                signal = pending_signals[symbol]
+                symbol_candle = group[group['symbol'] == symbol]
+                if not symbol_candle.empty:
+                    current_open_price = symbol_candle['open'].iloc[0]
+                    current_bar_open_prices[symbol] = current_open_price
+
+                    if signal.signal_type == SignalType.ENTRY and symbol not in open_trades:
+                        # Strategy should have already filtered based on max_concurrent_positions
+                        potential_entries.append((symbol, signal, current_open_price))
+                    elif signal.signal_type == SignalType.EXIT and symbol in open_trades:
+                        potential_exits.append((symbol, signal, current_open_price))
+                    else:
+                        logger.debug(f"Discarding invalid pending signal for {symbol}: {signal.signal_type}")
+                        if symbol in pending_signals: del pending_signals[symbol] # Clean up invalid signal
+                else:
+                    logger.warning(f"Could not find current bar data for symbol {symbol} at {timestamp} to execute pending signal. Signal ignored.")
+                    if symbol in pending_signals: del pending_signals[symbol] # Clean up unexecutable signal
+
+            # --- Execute Exits First ---
+            for symbol, signal, current_open_price in potential_exits:
+                trade = open_trades[symbol]
+                exit_price = self._apply_slippage(current_open_price, False)
+                exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
+
+                if signal.exit_reason == ExitReason.PARTIAL_TAKE_PROFIT:
+                    # Validate the close_quantity from the signal
+                    close_quantity = signal.close_quantity
+
+                    if close_quantity is None or close_quantity <= 0:
+                        logger.error(f"{timestamp} - EXECUTE PARTIAL EXIT FAILED for {symbol}: Invalid close_quantity ({close_quantity}) received from signal. Signal ID: {signal.id}")
+                        # Remove the problematic signal
+                        if symbol in pending_signals: del pending_signals[symbol]
+                        continue # Skip this exit
+
+                    # Check if the requested close_quantity exceeds the currently held quantity
+                    if close_quantity > trade.quantity:
+                        logger.warning(f"{timestamp} - EXECUTE PARTIAL EXIT ADJUSTED for {symbol}: Requested close_quantity ({close_quantity}) > current holding ({trade.quantity}). Closing remaining quantity. Signal ID: {signal.id}")
+                        close_quantity = trade.quantity # Adjust to close only what's left
+
+                    # Log before attempting partial close
+                    logger.debug(f"Attempting partial close for {symbol}: Trade Qty={trade.quantity}, Close Qty={close_quantity}")
+
+                    try:
+                        partial_pnl = trade.partial_close(exit_price, timestamp, exit_reason, close_quantity)
+                        commission = self._calculate_commission(exit_price, close_quantity)
+                        proceeds = exit_price * close_quantity - commission
+                        cash += proceeds
+                        # Update strategy state about the partial close (important for future signals)
+                        # Pass the remaining quantity back to the strategy
+                        updated_details = {'quantity': trade.quantity}
+                        self.strategy.update_open_position(symbol, updated_details)
+                        logger.info(f"{timestamp} - EXECUTE PARTIAL EXIT: {symbol} Qty: {close_quantity} @ {exit_price:.2f} (Open), Reason: {exit_reason}, PnL: {partial_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}, Remaining Qty: {trade.quantity}")
+
+                        # If partial close resulted in zero quantity, treat as full close for tracking
+                        if trade.quantity == 0:
+                             logger.info(f"{timestamp} - Position {symbol} fully closed after partial exit.")
+                             self.trades.append(trade) # Add to completed trades list
+                             del open_trades[symbol]
+                             # Notify strategy of full closure
+                             self.strategy.update_open_position(symbol, None)
+
+
+                    except ValueError as e:
+                        # This should ideally not happen with the checks above, but log if it does
+                        logger.error(f"{timestamp} - EXECUTE PARTIAL EXIT FAILED for {symbol} during trade.partial_close: {e}. Trade Qty={trade.quantity}, Close Qty={close_quantity}. Signal ID: {signal.id}")
+
+                else: # Full Exit
+                    close_quantity = trade.quantity
+                    trade_pnl = trade.close(exit_price, timestamp, exit_reason)
+                    commission = self._calculate_commission(exit_price, close_quantity)
+                    proceeds = exit_price * close_quantity - commission
+                    cash += proceeds
+                    self.trades.append(trade)
+                    del open_trades[symbol]
+                    # Notify strategy of full closure
+                    self.strategy.update_open_position(symbol, None)
+                    logger.info(f"{timestamp} - EXECUTE FULL EXIT: {symbol} Qty: {close_quantity} @ {exit_price:.2f} (Open), Reason: {exit_reason}, PnL: {trade_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
+
+                # Remove the executed exit signal
+                if symbol in pending_signals: del pending_signals[symbol]
+
+            # --- Execute Entries ---
+            # No ranking needed here anymore, strategy pre-filters based on its limit.
+            # We still need to respect the backtester's view of open_trades as a safeguard.
+            for symbol, signal, current_open_price in potential_entries:
+                # Safeguard check in backtester (should ideally not be needed if strategy logic is correct)
+                if len(open_trades) >= self.max_concurrent_positions:
+                    logger.warning(f"{timestamp} - EXECUTE ENTRY Skipped (Backtester Safeguard: Max concurrent positions limit reached: {self.max_concurrent_positions}): {symbol}")
+                    # Remove pending signal if skipped by safeguard
+                    if symbol in pending_signals: del pending_signals[symbol]
+                    # Also tell the strategy its tentative entry failed
+                    self.strategy.update_open_position(symbol, None)
+                    continue
+
+                entry_price = self._apply_slippage(current_open_price, True)
+
+                # Calculate position size
+                prev_data_slice = processed_data_slices[symbol]
+                # Calculate equity *before* this potential trade for allocation %
+                equity_before_trade = cash + sum(
+                    t.quantity * current_bar_open_prices.get(s, processed_data_slices[s]['close'].iloc[-1])
+                    for s, t in open_trades.items() if not processed_data_slices[s].empty
+                )
+                capital_percent = self.strategy.calculate_entry_quantity_percent() # Removed symbol argument
+                position_value = equity_before_trade * capital_percent # Use equity *before* this trade
+                position_size = int(position_value / entry_price) if entry_price > 0 else 0
+
+                if position_size > 0:
+                    commission = self._calculate_commission(entry_price, position_size)
+                    cost = entry_price * position_size + commission
+                    if cost <= cash:
+                        initial_stop_loss_level = signal.stop_loss_level
+
+                        trade = Trade(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            entry_time=timestamp,
+                            quantity=position_size,
+                            initial_stop_loss=initial_stop_loss_level,
+                        )
+                        cash -= cost
+                        open_trades[symbol] = trade
+                        # Confirm details back to strategy (Reverted: removed trail stop)
+                        confirmed_details = {
+                            'entry_price': entry_price,
+                            'quantity': position_size,
+                            'initial_quantity': position_size,
+                        }
+                        self.strategy.update_open_position(symbol, confirmed_details)
+                        logger.info(f"{timestamp} - EXECUTE ENTRY: {symbol} Qty: {position_size} @ {entry_price:.2f} (Open), Cost: {cost:.2f}, Cash: {cash:.2f}")
+                    else:
+                        logger.warning(f"{timestamp} - EXECUTE ENTRY Skipped (Insufficient cash): {symbol} @ {entry_price:.2f}, Cost: {cost:.2f}, Available: {cash:.2f}")
+                        # Tell the strategy the tentative entry failed
+                        self.strategy.update_open_position(symbol, None)
+                else:
+                    logger.warning(f"{timestamp} - EXECUTE ENTRY Skipped (Zero quantity): {symbol} @ {entry_price:.2f}")
+                    # Tell the strategy the tentative entry failed
+                    self.strategy.update_open_position(symbol, None)
+
+                # Remove the processed entry signal (whether executed or skipped)
+                if symbol in pending_signals: del pending_signals[symbol]
+
+
+            # --- Second Pass: Process Current Bar's Close for Next Bar's Signals ---
+            new_pending_signals = {} # Store signals generated in this pass
             for idx, candle in group.iterrows():
-                # Extract the actual symbol string from the 'symbol' column
                 actual_symbol = candle['symbol']
-
-                # Ensure the symbol exists in processed_data_slices (should always be true)
-                if actual_symbol not in processed_data_slices:
-                    logger.error(f"Logic Error: Symbol '{actual_symbol}' not found in processed_data_slices at {timestamp}")
-                    continue # Skip this candle
 
                 # Append current candle to the processed slice for this symbol
                 candle_df_row = candle.to_frame().T
                 candle_df_row.index = pd.DatetimeIndex([timestamp])
-                # Ensure columns match using the correct symbol key
                 candle_df_row = candle_df_row.reindex(columns=processed_data_slices[actual_symbol].columns, fill_value=np.nan)
-
-                # Use concat instead of append, handling the initial empty DataFrame case
                 if processed_data_slices[actual_symbol].empty:
                     processed_data_slices[actual_symbol] = candle_df_row
                 else:
                     processed_data_slices[actual_symbol] = pd.concat([processed_data_slices[actual_symbol], candle_df_row])
 
-                # Generate signal using data up to current candle for this symbol
-                # Pass the correct symbol string
+                # Generate signal based on the close of this bar
                 signal = self.strategy.process_candle(processed_data_slices[actual_symbol], actual_symbol)
 
                 if signal:
-                    logger.debug(f"Signal received at {timestamp} for {actual_symbol}: {signal}")
-                    # --- Handle Entry Signal ---
-                    # Use actual_symbol for checking open_trades
-                    if signal.signal_type == SignalType.ENTRY and actual_symbol not in open_trades:
-                        entry_price = self._apply_slippage(signal.price, True)
+                    # Store signal to be executed on the *next* bar's open
+                    new_pending_signals[actual_symbol] = signal
+                    logger.debug(f"Signal generated at {timestamp} close for {actual_symbol}: {signal}. Pending for next bar.")
 
-                        # Calculate position size based on strategy logic and equity
-                        # Use actual_symbol when accessing processed_data_slices
-                        equity_at_entry = cash + sum(t.quantity * processed_data_slices[t.symbol]['close'].iloc[-1] for s, t in open_trades.items() if s != actual_symbol and not processed_data_slices[t.symbol].empty) # Approx equity
-                        capital_percent = self.strategy.calculate_entry_quantity_percent(processed_data_slices[actual_symbol])
-                        position_value = equity_at_entry * capital_percent
-                        position_size = int(position_value / entry_price) if entry_price > 0 else 0
+            # Update pending signals for the next iteration
+            pending_signals = new_pending_signals
 
-                        if position_size > 0:
-                            commission = self._calculate_commission(entry_price, position_size)
-                            cost = entry_price * position_size + commission
-
-                            if cost <= cash: # Check affordability
-                                # Get SL/TP levels from strategy's internal state for this entry
-                                # Use actual_symbol
-                                pos_details = self.strategy.open_positions.get(actual_symbol, {})
-                                stop_loss_level = pos_details.get('stop_loss', signal.stop_loss_level) # Use signal's SL as fallback
-                                take_profit1_level = pos_details.get('take_profit1')
-                                take_profit2_level = pos_details.get('take_profit2')
-
-                                trade = Trade(
-                                    symbol=actual_symbol, # Use actual_symbol
-                                    entry_price=entry_price,
-                                    entry_time=timestamp,
-                                    quantity=position_size,
-                                    stop_loss=stop_loss_level
-                                )
-                                trade.take_profit1 = take_profit1_level
-                                trade.take_profit2 = take_profit2_level
-
-                                cash -= cost
-                                open_trades[actual_symbol] = trade # Use actual_symbol
-
-                                # Update strategy's internal tracking AFTER trade is confirmed
-                                # Use actual_symbol
-                                self.strategy.update_open_position(actual_symbol, {
-                                    'entry_price': trade.entry_price,
-                                    'quantity': trade.quantity,
-                                    'initial_quantity': trade.initial_quantity,
-                                    'stop_loss': trade.stop_loss,
-                                    'take_profit1': trade.take_profit1,
-                                    'take_profit2': trade.take_profit2
-                                })
-
-                                logger.info(f"{timestamp} - ENTRY: {actual_symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
-                            else:
-                                logger.warning(f"{timestamp} - ENTRY Skipped (Insufficient cash): {actual_symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
-                                # Remove placeholder from strategy tracking if entry failed
-                                # Use actual_symbol
-                                self.strategy.update_open_position(actual_symbol, None)
-                        else:
-                            logger.warning(f"{timestamp} - ENTRY Skipped (Zero quantity): {actual_symbol} @ {entry_price:.2f}")
-                            # Remove placeholder from strategy tracking if entry failed
-                            # Use actual_symbol
-                            self.strategy.update_open_position(actual_symbol, None)
-
-
-                    # --- Handle Exit Signal ---
-                    # Use actual_symbol
-                    elif signal.signal_type == SignalType.EXIT and actual_symbol in open_trades:
-                        trade = open_trades[actual_symbol] # Use actual_symbol
-                        exit_price = self._apply_slippage(signal.price, False)
-                        exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
-
-                        # Handle Partial Exit
-                        if signal.exit_reason == ExitReason.PARTIAL_TAKE_PROFIT:
-                            # Close 50% of the initial quantity
-                            close_quantity = trade.initial_quantity // 2
-                            if close_quantity > 0 and trade.quantity >= close_quantity:
-                                commission = self._calculate_commission(exit_price, close_quantity)
-                                proceeds = exit_price * close_quantity - commission
-                                partial_pnl = trade.partial_close(exit_price, timestamp, exit_reason, close_quantity)
-                                cash += proceeds
-                                logger.info(f"{timestamp} - PARTIAL EXIT: {actual_symbol} Qty: {close_quantity} @ {exit_price:.2f}, PnL: {partial_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
-                                # Update strategy tracking with remaining quantity
-                                # Use actual_symbol
-                                self.strategy.update_open_position(actual_symbol, {
-                                    'entry_price': trade.entry_price,
-                                    'quantity': trade.quantity, # Remaining quantity
-                                    'initial_quantity': trade.initial_quantity,
-                                    'stop_loss': trade.stop_loss,
-                                    'take_profit1': trade.take_profit1, # Keep levels
-                                    'take_profit2': trade.take_profit2
-                                })
-                            else:
-                                logger.warning(f"{timestamp} - Partial exit skipped for {actual_symbol}: Invalid quantity ({close_quantity}) or already partially closed?")
-
-                        # Handle Full Exit
-                        else:
-                            close_quantity = trade.quantity # Close remaining quantity
-                            commission = self._calculate_commission(exit_price, close_quantity)
-                            proceeds = exit_price * close_quantity - commission
-                            trade_pnl = trade.close(exit_price, timestamp, exit_reason) # Closes remaining quantity
-                            cash += proceeds
-                            self.trades.append(trade)
-                            del open_trades[actual_symbol] # Use actual_symbol
-                            # Update strategy tracking (position closed)
-                            # Use actual_symbol
-                            self.strategy.update_open_position(actual_symbol, None)
-                            logger.info(f"{timestamp} - FULL EXIT: {actual_symbol} Qty: {close_quantity} @ {exit_price:.2f}, Reason: {exit_reason}, PnL: {trade_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
-
-
-            # --- Update Equity Curve ---
-            # Calculate equity at the end of the timestamp after processing all symbols
+            # --- Update Equity Curve (End of Bar) ---
             current_equity = cash
             for sym, trade in open_trades.items():
-                # Use the last known close price for the symbol up to this timestamp
                 if sym in processed_data_slices and not processed_data_slices[sym].empty:
+                    # Use the close price of the current bar for end-of-bar equity calculation
                     current_price = processed_data_slices[sym]['close'].iloc[-1]
                     position_value = trade.quantity * current_price
                     current_equity += position_value
                 else:
-                    # Handle case where symbol data might not be present at this exact timestamp (unlikely with hourly)
-                    logger.warning(f"Missing price data for open trade {sym} at {timestamp}")
-
+                    logger.warning(f"Missing price data for open trade {sym} at {timestamp} for equity calculation.")
 
             equity_curve.append({'timestamp': timestamp, 'equity': current_equity})
 
@@ -863,72 +910,55 @@ class Backtester:
             if len(equity_curve) > 1:
                 prev_equity = equity_curve[-2]['equity']
                 bar_ret = (current_equity - prev_equity) / prev_equity if prev_equity != 0 else 0
-                # Store with timestamp for potential analysis, date might be less relevant now
                 bar_returns.append({'timestamp': timestamp, 'return': bar_ret})
 
-
-        # Close any remaining open trades at the end of the backtest
+        # --- End of Backtest Cleanup ---
+        # Close remaining open trades using the last available close price
         if not all_data.empty:
-            last_timestamp = all_data.index[-1]
+            last_timestamp = unique_timestamps[-1]
             for symbol, trade in list(open_trades.items()):
                  if symbol in processed_data_slices and not processed_data_slices[symbol].empty:
-                    last_price = processed_data_slices[symbol]['close'].iloc[-1]
-                    exit_price = self._apply_slippage(last_price, False)
+                    last_close_price = processed_data_slices[symbol]['close'].iloc[-1]
+                    # Use last close for end-of-backtest exit
+                    exit_price = self._apply_slippage(last_close_price, False)
                     close_quantity = trade.quantity
                     commission = self._calculate_commission(exit_price, close_quantity)
                     proceeds = exit_price * close_quantity - commission
                     trade_pnl = trade.close(exit_price, last_timestamp, "END_OF_BACKTEST")
                     cash += proceeds
                     self.trades.append(trade)
-                    logger.info(f"End of Backtest - Closing {symbol} Qty: {close_quantity} @ {exit_price:.2f}, PnL: {trade_pnl:.2f}, Cash: {cash:.2f}")
+                    logger.info(f"End of Backtest - Closing {symbol} Qty: {close_quantity} @ {exit_price:.2f} (Last Close), PnL: {trade_pnl:.2f}, Cash: {cash:.2f}")
                  else:
                      logger.warning(f"Could not close remaining trade for {symbol} at end of backtest - missing data.")
 
-
+        # ... rest of the function (metrics calculation, saving results) remains the same ...
         # Convert equity curve and bar returns to DataFrames
         if equity_curve:
             self.equity_curve = pd.DataFrame(equity_curve).set_index('timestamp')
-            
-            # Calculate performance metrics
-            # Use timestamp index for returns calculation
             bar_returns_df = pd.DataFrame(bar_returns).set_index('timestamp') if bar_returns else \
                               pd.DataFrame(columns=['return']).set_index(pd.Index([], name='timestamp'))
-            
             self.metrics = self._calculate_metrics(self.equity_curve, bar_returns_df)
-            
             logger.info(f"Backtest completed: {self.metrics['total_trades']} trades, Final equity: {self.metrics['final_equity']:.2f}")
         else:
-            # No trades were executed
+            # ... handle no trades case ...
             self.equity_curve = pd.DataFrame(columns=['equity'])
-            self.metrics = {
+            self.metrics = { # Default metrics for no trades
                 'start_date': start_date or 'N/A',
                 'end_date': end_date or 'N/A',
                 'duration_days': 0,
                 'starting_equity': self.starting_capital,
                 'final_equity': self.starting_capital,
-                'total_return': 0,
-                'total_return_percent': 0,
-                'annual_return': 0,
-                'annual_return_percent': 0,
-                'max_drawdown': 0,
-                'max_drawdown_percent': 0,
-                'sharpe_ratio': 0,
-                'total_trades': 0,
-                'win_trades': 0,
-                'loss_trades': 0,
-                'win_rate': 0,
-                'win_rate_percent': 0,
-                'avg_profit': 0,
-                'avg_loss': 0,
-                'profit_factor': 0,
-                'expectancy': 0,
-                'avg_trade': 0,
-                'avg_duration_minutes': 0
+                'total_return': 0, 'total_return_percent': 0,
+                'annual_return': 0, 'annual_return_percent': 0,
+                'max_drawdown': 0, 'max_drawdown_percent': 0,
+                'sharpe_ratio': 0, 'total_trades': 0, 'win_trades': 0, 'loss_trades': 0,
+                'win_rate': 0, 'win_rate_percent': 0, 'avg_profit': 0, 'avg_loss': 0,
+                'profit_factor': 0, 'expectancy': 0, 'avg_trade': 0, 'avg_duration_minutes': 0
             }
             logger.warning("Backtest completed with no trades")
-        
-        return self.metrics    
-    
+
+        return self.metrics
+
     def _apply_slippage(self, price: float, is_buy: bool) -> float:
         """
         Apply slippage to price.

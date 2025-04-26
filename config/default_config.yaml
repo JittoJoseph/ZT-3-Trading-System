@@ -15,6 +15,18 @@ symbols:
     tick_size: 0.05
     lot_size: 1
   # Add more symbols as needed
+  - ticker: "CANBK"
+    exchange: "NSE"
+    name: "Canara Bank"
+    min_qty: 1
+    tick_size: 0.05
+    lot_size: 1
+  - ticker: "RVNL"
+    exchange: "NSE"
+    name: "Rail Vikas Nigam Limited"
+    min_qty: 1
+    tick_size: 0.05
+    lot_size: 1
 
 # Strategy identifier (Parameters are now hardcoded in the strategy class)
 strategy:
@@ -82,3 +94,4 @@ backtest:
   starting_capital: 3000.0
   commission_percent: 0.03
   slippage_percent: 0.1
+  max_concurrent_positions: 2 # Limit the number of simultaneous open trades
