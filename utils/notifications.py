@@ -254,91 +254,89 @@ class NotificationManager:
     
     def send_backtest_results(self, metrics: Dict[str, Any]) -> bool:
         """
-        Send backtest results to Discord.
-        
+        Send backtest results summary to Discord.
+
         Args:
-            metrics: Backtest performance metrics
-            
+            metrics: Dictionary containing backtest performance metrics.
+
         Returns:
-            True if successful, False otherwise
+            True if the message was sent successfully, False otherwise.
         """
-        if not self.enabled or not self.webhooks.get('backtest_results'):
+        if not self.webhooks.get('backtest_results'):
+            logger.warning("Discord webhook URL not configured. Cannot send backtest results.")
             return False
-        
+
         try:
-            # Create formatted message
-            embed = {
-                "title": f"📊 Backtest Results: {metrics.get('symbol', 'Unknown')}",
-                "color": 3447003,  # Blue
-                "fields": [
-                    {
-                        "name": "Period",
-                        "value": f"{metrics.get('start_date', 'N/A')} to {metrics.get('end_date', 'N/A')} ({metrics.get('duration_days', 0)} days)",
-                        "inline": False
-                    },
-                    {
-                        "name": "Strategy",
-                        "value": f"{metrics.get('strategy_name', 'Unknown Strategy')}",
-                        "inline": True
-                    },
-                    {
-                        "name": "Total Return",
-                        "value": f"{metrics.get('total_return_percent', 0):.2f}%",
-                        "inline": True
-                    },
-                    {
-                        "name": "Annual Return",
-                        "value": f"{metrics.get('annual_return_percent', 0):.2f}%",
-                        "inline": True
-                    },
-                    {
-                        "name": "Sharpe Ratio",
-                        "value": f"{metrics.get('sharpe_ratio', 0):.2f}",
-                        "inline": True
-                    },
-                    {
-                        "name": "Max Drawdown",
-                        "value": f"{metrics.get('max_drawdown_percent', 0):.2f}%",
-                        "inline": True
-                    },
-                    {
-                        "name": "Win Rate",
-                        "value": f"{metrics.get('win_rate_percent', 0):.2f}%",
-                        "inline": True
-                    },
-                    {
-                        "name": "Profit Factor",
-                        "value": f"{metrics.get('profit_factor', 0):.2f}",
-                        "inline": True
-                    },
-                    {
-                        "name": "Total Trades",
-                        "value": f"{metrics.get('total_trades', 0)}",
-                        "inline": True
-                    }
-                ],
-                "footer": {
-                    "text": f"ZT-3 Backtester • {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                },
-                "timestamp": datetime.now().isoformat()  # Use ISO format for timestamp
-            }
+            # --- Create a more structured embed ---
+            strategy_name = metrics.get('strategy_name', 'Unknown Strategy')
+            symbols = metrics.get('symbol', 'N/A')
+            start_date = metrics.get('start_date', 'N/A')
+            end_date = metrics.get('end_date', 'N/A')
+            duration = metrics.get('duration_days', 'N/A')
+
+            # --- Build fields list with "Name: Value" format ---
+            fields_list = []
+
+            # Helper function to add a field if the metric exists
+            def add_metric_field(name, key, format_str="{:.2f}", unit=""):
+                value = metrics.get(key)
+                if value is not None:
+                    fields_list.append({
+                        "name": "\u200B", # Zero-width space for name
+                        "value": f"**{name}:** {format_str.format(value)}{unit}"
+                    })
+
+            # Add metrics in desired order
+            add_metric_field("Total Return", 'total_return_percent', unit="%")
+            add_metric_field("Max Drawdown", 'max_drawdown_percent', unit="%")
+            add_metric_field("Sharpe Ratio", 'sharpe_ratio')
             
-            data = {
-                "username": "ZT-3 Backtester",
+            # Add a separator line (optional) - using markdown
+            # fields_list.append({"name": "\u200B", "value": "---"}) 
+            
+            add_metric_field("Total Trades", 'total_trades', format_str="{:d}")
+            add_metric_field("Win Rate", 'win_rate_percent', unit="%")
+            add_metric_field("Profit Factor", 'profit_factor')
+            
+            # Custom format for Avg Profit/Loss
+            avg_profit = metrics.get('avg_profit')
+            avg_loss = metrics.get('avg_loss')
+            if avg_profit is not None and avg_loss is not None:
+                 fields_list.append({
+                     "name": "\u200B",
+                     "value": f"**Avg Profit/Loss:** {avg_profit:.2f} / {avg_loss:.2f}"
+                 })
+
+            add_metric_field("Expectancy", 'expectancy')
+            add_metric_field("Final Equity", 'final_equity')
+
+
+            embed = {
+                "title": f"Backtest Results: {strategy_name}", # Removed emoji
+                "description": f"**Symbols:** `{symbols}`\n**Period:** {start_date} to {end_date} ({duration} days)",
+                "color": 0x4CAF50,  # Green color
+                "timestamp": datetime.utcnow().isoformat(),
+                "fields": fields_list, # Use the generated list
+                "footer": {
+                    "text": "ZT-3 Backtester"
+                }
+            }
+
+            payload = {
                 "embeds": [embed]
             }
-            
-            response = requests.post(self.webhooks['backtest_results'], json=data)
-            
-            if response.status_code == 204:
-                logger.info("Backtest results sent to Discord")
+
+            response = requests.post(self.webhooks['backtest_results'], json=payload)
+
+            if response.status_code >= 200 and response.status_code < 300:
+                logger.info("Backtest results successfully sent to Discord.")
                 return True
             else:
-                logger.warning(f"Failed to send backtest results to Discord: {response.status_code} {response.text}")
+                logger.error(f"Failed to send Discord notification. Status: {response.status_code}, Response: {response.text}")
                 return False
-                
+
         except Exception as e:
-            logger.error(f"Error sending backtest results to Discord: {e}")
+            logger.error(f"Error sending Discord notification: {e}", exc_info=True)
             return False
 
     def send_error_notification(self, title: str, error_msg: str) -> bool:
