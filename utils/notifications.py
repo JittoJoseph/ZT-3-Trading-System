@@ -274,45 +274,56 @@ class NotificationManager:
             end_date = metrics.get('end_date', 'N/A')
             duration = metrics.get('duration_days', 'N/A')
 
-            # --- Build fields list with "Name: Value" format ---
+            # --- Build fields list with grouped "Name: Value" format ---
             fields_list = []
 
-            # Helper function to add a field if the metric exists
-            def add_metric_field(name, key, format_str="{:.2f}", unit=""):
-                value = metrics.get(key)
-                if value is not None:
-                    fields_list.append({
-                        "name": "\u200B", # Zero-width space for name
-                        "value": f"**{name}:** {format_str.format(value)}{unit}"
-                    })
+            # --- Performance Group ---
+            perf_lines = []
+            total_return = metrics.get('total_return_percent')
+            max_drawdown = metrics.get('max_drawdown_percent')
+            sharpe = metrics.get('sharpe_ratio')
+            if total_return is not None:
+                perf_lines.append(f"**Total Return:** {total_return:.2f}%")
+            if max_drawdown is not None:
+                perf_lines.append(f"**Max Drawdown:** {max_drawdown:.2f}%")
+            if sharpe is not None:
+                perf_lines.append(f"**Sharpe Ratio:** {sharpe:.2f}")
+            
+            if perf_lines:
+                 fields_list.append({"name": "Performance", "value": "\n".join(perf_lines)})
 
-            # Add metrics in desired order
-            add_metric_field("Total Return", 'total_return_percent', unit="%")
-            add_metric_field("Max Drawdown", 'max_drawdown_percent', unit="%")
-            add_metric_field("Sharpe Ratio", 'sharpe_ratio')
-            
-            # Add a separator line (optional) - using markdown
-            # fields_list.append({"name": "\u200B", "value": "---"}) 
-            
-            add_metric_field("Total Trades", 'total_trades', format_str="{:d}")
-            add_metric_field("Win Rate", 'win_rate_percent', unit="%")
-            add_metric_field("Profit Factor", 'profit_factor')
-            
-            # Custom format for Avg Profit/Loss
+
+            # --- Trade Stats Group ---
+            trade_lines = []
+            total_trades = metrics.get('total_trades')
+            win_rate = metrics.get('win_rate_percent')
+            profit_factor = metrics.get('profit_factor')
             avg_profit = metrics.get('avg_profit')
             avg_loss = metrics.get('avg_loss')
-            if avg_profit is not None and avg_loss is not None:
-                 fields_list.append({
-                     "name": "\u200B",
-                     "value": f"**Avg Profit/Loss:** {avg_profit:.2f} / {avg_loss:.2f}"
-                 })
+            expectancy = metrics.get('expectancy')
 
-            add_metric_field("Expectancy", 'expectancy')
-            add_metric_field("Final Equity", 'final_equity')
+            if total_trades is not None:
+                trade_lines.append(f"**Total Trades:** {total_trades:d}")
+            if win_rate is not None:
+                trade_lines.append(f"**Win Rate:** {win_rate:.2f}%")
+            if profit_factor is not None:
+                 trade_lines.append(f"**Profit Factor:** {profit_factor:.2f}")
+            if avg_profit is not None and avg_loss is not None:
+                 trade_lines.append(f"**Avg Profit/Loss:** {avg_profit:.2f} / {avg_loss:.2f}")
+            if expectancy is not None:
+                 trade_lines.append(f"**Expectancy:** {expectancy:.2f}")
+
+            if trade_lines:
+                 fields_list.append({"name": "Trade Stats", "value": "\n".join(trade_lines)})
+
+            # --- Final Equity (Optional Separate Group or add to Performance) ---
+            final_equity = metrics.get('final_equity')
+            if final_equity is not None:
+                fields_list.append({"name": "Summary", "value": f"**Final Equity:** {final_equity:.2f}"})
 
 
             embed = {
-                "title": f"Backtest Results: {strategy_name}", # Removed emoji
+                "title": f"Backtest Results: {strategy_name}",
                 "description": f"**Symbols:** `{symbols}`\n**Period:** {start_date} to {end_date} ({duration} days)",
                 "color": 0x4CAF50,  # Green color
                 "timestamp": datetime.utcnow().isoformat(),
