@@ -90,7 +90,13 @@ def parse_arguments():
         '--log-level', '-d',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         default='INFO',
-        help='Logging level'
+        help='Logging level for the log file and verbose console output' # Updated help text
+    )
+    
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Show detailed trade-by-trade INFO/WARNING messages from the backtester on the console'
     )
 
     return parser.parse_args()
@@ -100,13 +106,45 @@ def main():
     # Parse command line arguments
     args = parse_arguments()
     
-    # Set up logging
+    # Set up logging (applies level to file handler primarily, console might be INFO by default)
+    # Ensure setup_logging configures both a file handler (with args.log_level)
+    # and a console handler (e.g., default INFO, but we'll override for backtester below)
     setup_logging({
-        'level': args.log_level,
+        'level': args.log_level, # This level applies to the file handler
         'file': 'logs/backtest.log'
+        # Assuming setup_logging also adds a console handler, possibly at INFO level by default
     })
     logger = logging.getLogger(__name__)
-    
+
+    # Adjust console logging level for backtester unless --verbose is used
+    if not args.verbose:
+        bt_logger = logging.getLogger('backtest.backtester')
+        # Find the console handler (StreamHandler) and set its level higher (ERROR)
+        # to suppress INFO and WARNING messages on the console by default.
+        console_handler_found = False
+        for handler in bt_logger.handlers:
+            # Check if it's a console handler (StreamHandler) and not a FileHandler
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                logger.info(f"Setting console handler level for 'backtest.backtester' to ERROR (suppressing INFO/WARN). Use --verbose to see details.")
+                handler.setLevel(logging.ERROR)
+                console_handler_found = True
+                break # Assume only one console handler per logger instance
+
+        # If the specific logger didn't have a console handler (e.g., due to propagation),
+        # find and adjust the root logger's console handler.
+        if not console_handler_found:
+             root_logger = logging.getLogger()
+             for handler in root_logger.handlers:
+                 if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                     logger.info(f"Setting root console handler level for 'backtest.backtester' messages to ERROR (suppressing INFO/WARN). Use --verbose to see details.")
+                     # Note: This might affect other loggers if not handled carefully in setup_logging.
+                     # A more robust solution uses Filters, but level setting is simpler here.
+                     # We might need a filter specifically for backtest.backtester messages on this handler.
+                     # For simplicity, let's try setting the level first.
+                     handler.setLevel(logging.ERROR) # This might be too broad, consider filtering later if needed.
+                     break
+
+
     try:
         logger.info(f"Starting ZT-3 Backtesting (Config: {args.config})")
         

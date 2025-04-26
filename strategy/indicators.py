@@ -93,11 +93,13 @@ class Indicators:
 
         # Calculate RS and RSI
         rs = up_ema / down_ema
-        result['rsi'] = 100.0 - (100.0 / (1.0 + rs))
+        rsi_series = 100.0 - (100.0 / (1.0 + rs))
 
         # Handle potential NaN/inf values at the beginning or due to zero division
-        result['rsi'].fillna(method='bfill', inplace=True) # Backfill initial NaNs
-        result['rsi'].replace([np.inf, -np.inf], 100.0, inplace=True) # Replace inf with 100 (or 0 if needed)
+        rsi_series = rsi_series.bfill() # Backfill initial NaNs (replaces fillna with method)
+        rsi_series = rsi_series.replace([np.inf, -np.inf], 100.0) # Replace inf with 100 (or 0 if needed)
+
+        result['rsi'] = rsi_series # Assign the modified series back to the DataFrame
 
         return result
 

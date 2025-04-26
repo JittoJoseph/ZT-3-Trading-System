@@ -603,29 +603,40 @@ class Backtester:
 
         for timestamp, group in all_data.groupby(level=0):
             # Process signals for each symbol present at this timestamp
-            for symbol, candle in group.iterrows():
+            # Corrected loop: idx is the timestamp index, candle is the row Series
+            for idx, candle in group.iterrows():
+                # Extract the actual symbol string from the 'symbol' column
+                actual_symbol = candle['symbol']
+
+                # Ensure the symbol exists in processed_data_slices (should always be true)
+                if actual_symbol not in processed_data_slices:
+                    logger.error(f"Logic Error: Symbol '{actual_symbol}' not found in processed_data_slices at {timestamp}")
+                    continue # Skip this candle
+
                 # Append current candle to the processed slice for this symbol
-                # Ensure candle is a DataFrame row before appending
                 candle_df_row = candle.to_frame().T
-                candle_df_row.index = pd.DatetimeIndex([timestamp]) # Set the index correctly
-                # Ensure columns match
-                candle_df_row = candle_df_row.reindex(columns=processed_data_slices[symbol].columns, fill_value=np.nan)
+                candle_df_row.index = pd.DatetimeIndex([timestamp])
+                # Ensure columns match using the correct symbol key
+                candle_df_row = candle_df_row.reindex(columns=processed_data_slices[actual_symbol].columns, fill_value=np.nan)
 
                 # Use concat instead of append
-                processed_data_slices[symbol] = pd.concat([processed_data_slices[symbol], candle_df_row])
+                processed_data_slices[actual_symbol] = pd.concat([processed_data_slices[actual_symbol], candle_df_row])
 
                 # Generate signal using data up to current candle for this symbol
-                signal = self.strategy.process_candle(processed_data_slices[symbol], symbol)
+                # Pass the correct symbol string
+                signal = self.strategy.process_candle(processed_data_slices[actual_symbol], actual_symbol)
 
                 if signal:
-                    logger.debug(f"Signal received at {timestamp} for {symbol}: {signal}")
+                    logger.debug(f"Signal received at {timestamp} for {actual_symbol}: {signal}")
                     # --- Handle Entry Signal ---
-                    if signal.signal_type == SignalType.ENTRY and symbol not in open_trades:
+                    # Use actual_symbol for checking open_trades
+                    if signal.signal_type == SignalType.ENTRY and actual_symbol not in open_trades:
                         entry_price = self._apply_slippage(signal.price, True)
 
                         # Calculate position size based on strategy logic and equity
-                        equity_at_entry = cash + sum(t.quantity * processed_data_slices[t.symbol]['close'].iloc[-1] for s, t in open_trades.items() if s != symbol) # Approx equity
-                        capital_percent = self.strategy.calculate_entry_quantity_percent(processed_data_slices[symbol])
+                        # Use actual_symbol when accessing processed_data_slices
+                        equity_at_entry = cash + sum(t.quantity * processed_data_slices[t.symbol]['close'].iloc[-1] for s, t in open_trades.items() if s != actual_symbol and not processed_data_slices[t.symbol].empty) # Approx equity
+                        capital_percent = self.strategy.calculate_entry_quantity_percent(processed_data_slices[actual_symbol])
                         position_value = equity_at_entry * capital_percent
                         position_size = int(position_value / entry_price) if entry_price > 0 else 0
 
@@ -635,13 +646,14 @@ class Backtester:
 
                             if cost <= cash: # Check affordability
                                 # Get SL/TP levels from strategy's internal state for this entry
-                                pos_details = self.strategy.open_positions.get(symbol, {})
+                                # Use actual_symbol
+                                pos_details = self.strategy.open_positions.get(actual_symbol, {})
                                 stop_loss_level = pos_details.get('stop_loss', signal.stop_loss_level) # Use signal's SL as fallback
                                 take_profit1_level = pos_details.get('take_profit1')
                                 take_profit2_level = pos_details.get('take_profit2')
 
                                 trade = Trade(
-                                    symbol=symbol,
+                                    symbol=actual_symbol, # Use actual_symbol
                                     entry_price=entry_price,
                                     entry_time=timestamp,
                                     quantity=position_size,
@@ -651,10 +663,11 @@ class Backtester:
                                 trade.take_profit2 = take_profit2_level
 
                                 cash -= cost
-                                open_trades[symbol] = trade
+                                open_trades[actual_symbol] = trade # Use actual_symbol
 
                                 # Update strategy's internal tracking AFTER trade is confirmed
-                                self.strategy.update_open_position(symbol, {
+                                # Use actual_symbol
+                                self.strategy.update_open_position(actual_symbol, {
                                     'entry_price': trade.entry_price,
                                     'quantity': trade.quantity,
                                     'initial_quantity': trade.initial_quantity,
@@ -663,20 +676,23 @@ class Backtester:
                                     'take_profit2': trade.take_profit2
                                 })
 
-                                logger.info(f"{timestamp} - ENTRY: {symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
+                                logger.info(f"{timestamp} - ENTRY: {actual_symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
                             else:
-                                logger.warning(f"{timestamp} - ENTRY Skipped (Insufficient cash): {symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
+                                logger.warning(f"{timestamp} - ENTRY Skipped (Insufficient cash): {actual_symbol} Qty: {position_size} @ {entry_price:.2f}, Cost: {cost:.2f}, Cash: {cash:.2f}")
                                 # Remove placeholder from strategy tracking if entry failed
-                                self.strategy.update_open_position(symbol, None)
+                                # Use actual_symbol
+                                self.strategy.update_open_position(actual_symbol, None)
                         else:
-                            logger.warning(f"{timestamp} - ENTRY Skipped (Zero quantity): {symbol} @ {entry_price:.2f}")
+                            logger.warning(f"{timestamp} - ENTRY Skipped (Zero quantity): {actual_symbol} @ {entry_price:.2f}")
                             # Remove placeholder from strategy tracking if entry failed
-                            self.strategy.update_open_position(symbol, None)
+                            # Use actual_symbol
+                            self.strategy.update_open_position(actual_symbol, None)
 
 
                     # --- Handle Exit Signal ---
-                    elif signal.signal_type == SignalType.EXIT and symbol in open_trades:
-                        trade = open_trades[symbol]
+                    # Use actual_symbol
+                    elif signal.signal_type == SignalType.EXIT and actual_symbol in open_trades:
+                        trade = open_trades[actual_symbol] # Use actual_symbol
                         exit_price = self._apply_slippage(signal.price, False)
                         exit_reason = signal.exit_reason.value if signal.exit_reason else "SIGNAL"
 
@@ -689,9 +705,10 @@ class Backtester:
                                 proceeds = exit_price * close_quantity - commission
                                 partial_pnl = trade.partial_close(exit_price, timestamp, exit_reason, close_quantity)
                                 cash += proceeds
-                                logger.info(f"{timestamp} - PARTIAL EXIT: {symbol} Qty: {close_quantity} @ {exit_price:.2f}, PnL: {partial_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
+                                logger.info(f"{timestamp} - PARTIAL EXIT: {actual_symbol} Qty: {close_quantity} @ {exit_price:.2f}, PnL: {partial_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
                                 # Update strategy tracking with remaining quantity
-                                self.strategy.update_open_position(symbol, {
+                                # Use actual_symbol
+                                self.strategy.update_open_position(actual_symbol, {
                                     'entry_price': trade.entry_price,
                                     'quantity': trade.quantity, # Remaining quantity
                                     'initial_quantity': trade.initial_quantity,
@@ -700,7 +717,7 @@ class Backtester:
                                     'take_profit2': trade.take_profit2
                                 })
                             else:
-                                logger.warning(f"{timestamp} - Partial exit skipped for {symbol}: Invalid quantity ({close_quantity}) or already partially closed?")
+                                logger.warning(f"{timestamp} - Partial exit skipped for {actual_symbol}: Invalid quantity ({close_quantity}) or already partially closed?")
 
                         # Handle Full Exit
                         else:
@@ -710,10 +727,11 @@ class Backtester:
                             trade_pnl = trade.close(exit_price, timestamp, exit_reason) # Closes remaining quantity
                             cash += proceeds
                             self.trades.append(trade)
-                            del open_trades[symbol]
+                            del open_trades[actual_symbol] # Use actual_symbol
                             # Update strategy tracking (position closed)
-                            self.strategy.update_open_position(symbol, None)
-                            logger.info(f"{timestamp} - FULL EXIT: {symbol} Qty: {close_quantity} @ {exit_price:.2f}, Reason: {exit_reason}, PnL: {trade_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
+                            # Use actual_symbol
+                            self.strategy.update_open_position(actual_symbol, None)
+                            logger.info(f"{timestamp} - FULL EXIT: {actual_symbol} Qty: {close_quantity} @ {exit_price:.2f}, Reason: {exit_reason}, PnL: {trade_pnl:.2f}, Proceeds: {proceeds:.2f}, Cash: {cash:.2f}")
 
 
             # --- Update Equity Curve ---
