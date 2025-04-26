@@ -259,7 +259,7 @@ class Backtester:
                 # interval: str = 'day', # Removed interval parameter
                 csv_path: Optional[str] = None) -> pd.DataFrame:
         """
-        Load historical data for a symbol. Always uses 'day' interval.
+        Load historical data for a symbol. Always uses '1hour' interval via V3 API.
 
         Args:
             symbol: Trading symbol (format: exchange:ticker)
@@ -277,23 +277,18 @@ class Backtester:
             parts = symbol.split(':')
             if len(parts) != 2:
                 raise ValueError(f"Invalid symbol format: {symbol}. Expected format: 'exchange:ticker'")
-            
+
             exchange, ticker = parts
 
-            # Always use 'day' interval
-            interval = 'day'
-
-            # Validate interval for Upstox API (redundant now, but keep for safety)
-            valid_api_intervals = ['day', 'week', 'month', '1minute', '5minute', '10minute', '15minute', '30minute', '60minute']
-            if interval not in valid_api_intervals:
-                 # This should not happen now
-                 raise ValueError(f"Internal Error: Hardcoded interval '{interval}' is invalid.")
+            # Define desired interval details for V3 API
+            unit = 'hours'
+            interval_value = '1' # For 1-hour candles
 
             # Maximum number of retry attempts
             max_retries = 3
             retry_delay = 5  # seconds
             retry_attempt = 0
-            
+
             while retry_attempt < max_retries:
                 try:
                     # Check if we have access token
@@ -302,178 +297,288 @@ class Backtester:
                         logger.error(error_msg)
                         if self.notification_manager:
                             self.notification_manager.send_system_notification(
-                                "Authentication Error", 
-                                error_msg, 
+                                "Authentication Error",
+                                error_msg,
                                 "error"
                             )
                         raise ValueError(error_msg)
-                    
-                    # Fetch historical data from API
-                    logger.info(f"Attempt {retry_attempt+1}/{max_retries}: Fetching historical data for {symbol} ({interval}) from {start_date} to {end_date}")
-                    df = self._fetch_historical_data(ticker, exchange, interval, start_date, end_date)
-                    
+
+                    # Fetch historical data from API using V3 parameters
+                    logger.info(f"Attempt {retry_attempt+1}/{max_retries}: Fetching historical data (V3 API) for {symbol} ({interval_value}{unit}) from {start_date} to {end_date}")
+                    df = self._fetch_historical_data_v3(ticker, exchange, unit, interval_value, start_date, end_date)
+
                     if df.empty:
-                        logger.warning(f"No data returned from API for {symbol}")
+                        logger.warning(f"No data returned from V3 API for {symbol}")
                         retry_attempt += 1
                         if retry_attempt < max_retries:
                             logger.info(f"Retrying in {retry_delay} seconds...")
                             time.sleep(retry_delay)
                             continue
                         else:
-                            error_msg = f"No historical data available for {symbol} from {start_date} to {end_date} after {max_retries} attempts"
+                            error_msg = f"No historical data available for {symbol} from {start_date} to {end_date} after {max_retries} attempts (V3 API)"
                             logger.error(error_msg)
                             if self.notification_manager:
                                 self.notification_manager.send_system_notification(
-                                    "Data Fetch Error", 
-                                    error_msg, 
+                                    "Data Fetch Error",
+                                    error_msg,
                                     "error"
                                 )
                             raise ValueError(error_msg)
-                    
+
                     # Successfully fetched data
                     break
-                    
+
                 except Exception as e:
-                    logger.error(f"Error fetching data from API (attempt {retry_attempt+1}/{max_retries}): {e}")
+                    logger.error(f"Error fetching data from V3 API (attempt {retry_attempt+1}/{max_retries}): {e}")
                     retry_attempt += 1
-                    
+
                     if retry_attempt < max_retries:
                         logger.info(f"Retrying in {retry_delay} seconds...")
                         time.sleep(retry_delay)
                     else:
-                        error_msg = f"Failed to fetch historical data for {symbol} after {max_retries} attempts: {str(e)}"
+                        error_msg = f"Failed to fetch historical data for {symbol} after {max_retries} attempts (V3 API): {str(e)}"
                         logger.error(error_msg)
                         if self.notification_manager:
                             self.notification_manager.send_system_notification(
-                                "Data Fetch Failed", 
-                                error_msg, 
+                                "Data Fetch Failed",
+                                error_msg,
                                 "error"
                             )
                         raise ValueError(error_msg)
-        
+
         elif source == 'csv':
+            # ... existing CSV loading code ...
             if not csv_path:
                 raise ValueError("csv_path must be provided when source is 'csv'")
-            
+
             # Load data from CSV
             df = pd.read_csv(csv_path, parse_dates=['timestamp'])
-            
+
             # Filter by date range
             df = df[(df['timestamp'] >= start_date) & (df['timestamp'] <= end_date)]
-            
+
             # Set timestamp as index
             if 'timestamp' in df.columns:
                 df.set_index('timestamp', inplace=True)
-        
+
         else:
             raise ValueError(f"Unsupported data source: {source}")
-        
+
         # Add technical indicators required by the strategy
         # Ensure data is sorted by time before calculating indicators
         df.sort_index(inplace=True)
-        df = self.strategy.prepare_data(df) # Assumes daily data
+        df = self.strategy.prepare_data(df) # Assumes 1-hour data
 
         # Store the data
         self.data[symbol] = df
-        
+
         logger.info(f"Loaded {len(df)} data points for {symbol} from {start_date} to {end_date}")
         return df
-    
-    def _fetch_historical_data(self, ticker: str, exchange: str, interval: str, from_date: str, to_date: str) -> pd.DataFrame:
-        """
-        Fetch historical data from Upstox API V2.
 
-        Uses the V2 endpoint: /v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}
+    # Rename the old fetch method to avoid conflicts
+    def _fetch_historical_data_v2(self, ticker: str, exchange: str, interval: str, from_date: str, to_date: str) -> pd.DataFrame:
+        """
+        Fetch historical data from Upstox API V2 (DEPRECATED in favor of V3).
+        """
+        # ... (Keep the old V2 implementation here for reference or potential fallback) ...
+        # Look up the ISIN for this ticker from our mapping or use the instrument key format
+        instrument_key = self._get_instrument_key(ticker, exchange)
+        # ... rest of V2 implementation ...
+        logger.warning("Using deprecated V2 API fetch method.")
+        # Construct URL according to the V2 API docs format
+        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/day/2023-11-13/2023-11-01
+        # Using self.base_url which is already set to the V2 base.
+        # Map internal interval to V2 API interval string (e.g., '30minute' -> '30minute')
+        # V2 uses simple strings like 'day', 'week', 'month', '1minute', '30minute'
+        api_interval_map_v2 = {
+            '30minute': '30minute',
+            'day': 'day', 'week': 'week', 'month': 'month'
+        }
+        api_interval = api_interval_map_v2.get(interval)
+        if not api_interval:
+            logger.error(f"Interval '{interval}' not mappable to Upstox V2 API path.")
+            return pd.DataFrame()
+
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}'
+        }
+        encoded_instrument_key = requests.utils.quote(instrument_key)
+        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{api_interval}/{to_date}/{from_date}"
+        # ... rest of V2 request logic ...
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code != 200:
+                logger.error(f"V2 API request failed with status {response.status_code}: {response.text}")
+                return pd.DataFrame()
+            data = response.json()
+            if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
+                candles = data['data']['candles']
+                if not candles: return pd.DataFrame()
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
+                df.set_index('timestamp', inplace=True)
+                if 'oi' in df.columns: df.drop(columns=['oi'], inplace=True)
+                return df
+            else:
+                logger.error(f"Invalid V2 response format: {data}")
+                return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"Error fetching V2 historical data: {e}")
+            return pd.DataFrame()
+
+
+    def _fetch_historical_data_v3(self, ticker: str, exchange: str, unit: str, interval_value: str, from_date: str, to_date: str) -> pd.DataFrame:
+        """
+        Fetch historical data from Upstox API V3. Handles quarterly limits for hourly data.
+
+        Uses the V3 endpoint: /v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}
 
         Args:
             ticker: Trading symbol
             exchange: Exchange code
-            interval: Timeframe interval (e.g., 'day', '30minute')
+            unit: Timeframe unit ('minutes', 'hours', 'days', 'weeks', 'months')
+            interval_value: Interval value (e.g., '1', '5', '60')
             from_date: Start date in YYYY-MM-DD format
             to_date: End date in YYYY-MM-DD format
 
         Returns:
             DataFrame with historical data
         """
-        # Look up the ISIN for this ticker from our mapping or use the instrument key format
-        instrument_key = self._get_instrument_key(ticker, exchange)
+        # Log the received dates immediately
+        logger.debug(f"Entering _fetch_historical_data_v3 for {ticker} ({exchange})")
+        logger.debug(f"Received from_date: '{from_date}' (type: {type(from_date)}), to_date: '{to_date}' (type: {type(to_date)})")
 
-        # Set up headers as required by the API documentation
+        # Validate date format before proceeding
+        try:
+            start_dt = datetime.strptime(from_date, '%Y-%m-%d')
+            end_dt = datetime.strptime(to_date, '%Y-%m-%d')
+            logger.debug("Date formats appear valid (YYYY-MM-DD).")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid date format or type detected! from_date='{from_date}', to_date='{to_date}'. Error: {e}")
+            return pd.DataFrame()
+
+        instrument_key = self._get_instrument_key(ticker, exchange)
         headers = {
             'Accept': 'application/json',
             'Authorization': f'Bearer {self.access_token}'
         }
-
-        # URL encode the instrument key
         encoded_instrument_key = requests.utils.quote(instrument_key)
+        v3_base_url = "https://api.upstox.com"
 
-        # Map internal interval to V2 API interval string (e.g., 'day' -> 'day')
-        # V2 uses simple strings like 'day', 'week', 'month', '1minute', '30minute'
-        api_interval_map_v2 = {
-            '1minute': '1minute', '5minute': '5minute', '10minute': '10minute', # Assuming these might be used elsewhere, though backtester uses 'day'
-            '15minute': '15minute', '30minute': '30minute', '60minute': '60minute',
-            'day': 'day', 'week': 'week', 'month': 'month'
-        }
-        api_interval = api_interval_map_v2.get(interval)
-        if not api_interval:
-            # This should not happen if interval is always 'day' from load_data
-            logger.error(f"Interval '{interval}' not mappable to Upstox V2 API path.")
-            return pd.DataFrame()
+        # Define max duration for hourly data (approx 1 quarter = 90 days)
+        max_duration_days = 90
+        chunk_delay = 0.5 # Small delay between chunk requests
 
+        all_data_chunks = []
 
-        # Construct URL according to the V2 API docs format
-        # Example: https://api.upstox.com/v2/historical-candle/NSE_EQ%7CINE848E01016/day/2023-11-13/2023-11-01
-        # Using self.base_url which is already set to the V2 base.
-        url = f"{self.base_url}/historical-candle/{encoded_instrument_key}/{api_interval}/{to_date}/{from_date}"
+        # Check if chunking is needed (only for 'hours' unit and duration > max_duration_days)
+        if unit == 'hours' and (end_dt - start_dt).days > max_duration_days:
+            logger.info(f"Hourly data request exceeds {max_duration_days} days. Fetching in chunks...")
+            current_to_date = end_dt
+            while current_to_date >= start_dt:
+                # Calculate start date for this chunk (max 90 days back, but not before original from_date)
+                current_from_date = max(start_dt, current_to_date - timedelta(days=max_duration_days - 1)) # -1 to make range inclusive? Check API behavior. Let's try 90 days span.
+                current_from_date_str = current_from_date.strftime('%Y-%m-%d')
+                current_to_date_str = current_to_date.strftime('%Y-%m-%d')
 
-        logger.info(f"Fetching historical data from V2 URL: {url}")
+                logger.debug(f"Fetching chunk: {current_from_date_str} to {current_to_date_str}")
 
-        try:
-            # Make the API request
-            response = requests.get(url, headers=headers)
-            
-            # Check for successful response
-            if response.status_code != 200:
-                logger.error(f"API request failed with status {response.status_code}: {response.text}")
-                return pd.DataFrame()
-            
-            # Parse the response JSON
-            data = response.json()
-            
-            # Check if data was returned successfully
-            if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
-                candles = data['data']['candles']
-                
-                if not candles:
-                    logger.warning(f"No candles returned for {exchange}:{ticker}")
-                    return pd.DataFrame()
-                
-                # Create DataFrame from candles data
-                # According to the documentation, the candle data format is:
-                # [timestamp, open, high, low, close, volume, oi]
-                df = pd.DataFrame(candles, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'
-                ])
-                
-                # Convert timestamp to datetime and ensure timezone-naive
-                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
-                
-                # Set timestamp as index
-                df.set_index('timestamp', inplace=True)
-                
-                # Drop open interest column if it exists and is not needed
-                if 'oi' in df.columns:
-                    df.drop(columns=['oi'], inplace=True)
-                
-                logger.info(f"Retrieved {len(df)} historical candles for {exchange}:{ticker}")
-                return df
+                url = f"{v3_base_url}/v3/historical-candle/{encoded_instrument_key}/{unit}/{interval_value}/{current_to_date_str}/{current_from_date_str}"
+                logger.debug(f"Chunk URL: {url}")
+
+                try:
+                    response = requests.get(url, headers=headers)
+                    if response.status_code != 200:
+                        logger.error(f"V3 API chunk request failed ({current_from_date_str} to {current_to_date_str}) with status {response.status_code}: {response.text}")
+                        # Attempt to parse error details if JSON
+                        try:
+                            error_data = response.json()
+                            logger.error(f"V3 API Error Details: {error_data}")
+                        except json.JSONDecodeError:
+                            pass
+                        # Decide how to handle chunk failure: stop or skip? Let's stop for now.
+                        return pd.DataFrame() # Return empty if any chunk fails
+
+                    data = response.json()
+                    if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
+                        candles = data['data']['candles']
+                        if candles:
+                            df_chunk = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                            all_data_chunks.insert(0, df_chunk) # Prepend to maintain order
+                            logger.debug(f"Retrieved {len(df_chunk)} candles for chunk.")
+                        else:
+                            logger.debug(f"No candles returned for chunk {current_from_date_str} to {current_to_date_str}.")
+                    else:
+                        logger.error(f"Invalid V3 response format for chunk: {data}")
+                        return pd.DataFrame() # Stop if format is invalid
+
+                except Exception as e:
+                    logger.error(f"Error fetching V3 historical data chunk: {e}")
+                    return pd.DataFrame() # Stop on exception
+
+                # Move to the previous chunk
+                current_to_date = current_from_date - timedelta(days=1)
+                time.sleep(chunk_delay) # Be nice to the API
+
+            # Concatenate all chunks if any were fetched
+            if all_data_chunks:
+                final_df = pd.concat(all_data_chunks, ignore_index=True)
+                # Convert timestamp, set index, drop 'oi'
+                final_df['timestamp'] = pd.to_datetime(final_df['timestamp']).dt.tz_localize(None)
+                final_df.set_index('timestamp', inplace=True)
+                if 'oi' in final_df.columns:
+                    final_df.drop(columns=['oi'], inplace=True)
+                # Remove potential duplicates from overlapping chunks (if any)
+                final_df = final_df[~final_df.index.duplicated(keep='first')]
+                final_df.sort_index(inplace=True) # Ensure final sort
+                logger.info(f"Successfully retrieved {len(final_df)} total historical candles (V3) in chunks for {exchange}:{ticker}")
+                return final_df
             else:
-                logger.error(f"Invalid response format: {data}")
+                logger.warning(f"No data retrieved after chunking for {exchange}:{ticker}")
                 return pd.DataFrame()
-                
-        except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            return pd.DataFrame()
+
+        else:
+            # Original logic for single API call (if duration is within limits or unit is not 'hours')
+            logger.debug("Request duration within limits or unit is not 'hours'. Making single API call.")
+            url = f"{v3_base_url}/v3/historical-candle/{encoded_instrument_key}/{unit}/{interval_value}/{to_date}/{from_date}"
+            logger.debug(f"Constructed V3 URL: {url}")
+
+            try:
+                response = requests.get(url, headers=headers)
+
+                if response.status_code != 200:
+                    logger.error(f"V3 API request failed with status {response.status_code}: {response.text}")
+                    try:
+                        error_data = response.json()
+                        logger.error(f"V3 API Error Details: {error_data}")
+                    except json.JSONDecodeError:
+                        pass
+                    return pd.DataFrame()
+
+                data = response.json()
+
+                if data.get('status') == 'success' and 'data' in data and 'candles' in data['data']:
+                    candles = data['data']['candles']
+                    if not candles:
+                        logger.warning(f"No candles returned from V3 API for {exchange}:{ticker}")
+                        return pd.DataFrame()
+
+                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
+                    df.set_index('timestamp', inplace=True)
+                    if 'oi' in df.columns:
+                        df.drop(columns=['oi'], inplace=True)
+                    df.sort_index(inplace=True) # Ensure sorted
+                    logger.info(f"Retrieved {len(df)} historical candles (V3) for {exchange}:{ticker}")
+                    return df
+                else:
+                    logger.error(f"Invalid V3 response format: {data}")
+                    return pd.DataFrame()
+
+            except Exception as e:
+                logger.error(f"Error fetching V3 historical data: {e}")
+                return pd.DataFrame()
 
     def _get_instrument_key(self, ticker: str, exchange: str) -> str:
         """
@@ -575,7 +680,7 @@ class Backtester:
         cash = self.starting_capital
         equity = cash
         equity_curve = []
-        daily_returns = [] # Still relevant even for daily strat, represents return per bar
+        bar_returns = [] # Renamed from daily_returns
 
         # Reset strategy state before iterating data
         self.strategy.reset_position_tracking()
@@ -747,17 +852,18 @@ class Backtester:
                     position_value = trade.quantity * current_price
                     current_equity += position_value
                 else:
-                    # Handle case where symbol data might not be present at this exact timestamp (unlikely with daily)
+                    # Handle case where symbol data might not be present at this exact timestamp (unlikely with hourly)
                     logger.warning(f"Missing price data for open trade {sym} at {timestamp}")
 
 
             equity_curve.append({'timestamp': timestamp, 'equity': current_equity})
 
-            # Calculate daily return (return per bar in this case)
+            # Calculate return per bar
             if len(equity_curve) > 1:
                 prev_equity = equity_curve[-2]['equity']
-                daily_ret = (current_equity - prev_equity) / prev_equity if prev_equity != 0 else 0
-                daily_returns.append({'date': timestamp.date(), 'return': daily_ret})
+                bar_ret = (current_equity - prev_equity) / prev_equity if prev_equity != 0 else 0
+                # Store with timestamp for potential analysis, date might be less relevant now
+                bar_returns.append({'timestamp': timestamp, 'return': bar_ret})
 
 
         # Close any remaining open trades at the end of the backtest
@@ -778,15 +884,16 @@ class Backtester:
                      logger.warning(f"Could not close remaining trade for {symbol} at end of backtest - missing data.")
 
 
-        # Convert equity curve and daily returns to DataFrames
+        # Convert equity curve and bar returns to DataFrames
         if equity_curve:
             self.equity_curve = pd.DataFrame(equity_curve).set_index('timestamp')
             
             # Calculate performance metrics
-            daily_returns_df = pd.DataFrame(daily_returns).set_index('date') if daily_returns else \
-                              pd.DataFrame(columns=['return']).set_index(pd.Index([], name='date'))
+            # Use timestamp index for returns calculation
+            bar_returns_df = pd.DataFrame(bar_returns).set_index('timestamp') if bar_returns else \
+                              pd.DataFrame(columns=['return']).set_index(pd.Index([], name='timestamp'))
             
-            self.metrics = self._calculate_metrics(self.equity_curve, daily_returns_df)
+            self.metrics = self._calculate_metrics(self.equity_curve, bar_returns_df)
             
             logger.info(f"Backtest completed: {self.metrics['total_trades']} trades, Final equity: {self.metrics['final_equity']:.2f}")
         else:
@@ -858,13 +965,13 @@ class Backtester:
         trade_value = price * quantity
         return trade_value * self.commission_percent / 100.0
     
-    def _calculate_metrics(self, equity_curve: pd.DataFrame, daily_returns: pd.DataFrame) -> Dict[str, Any]:
+    def _calculate_metrics(self, equity_curve: pd.DataFrame, bar_returns: pd.DataFrame) -> Dict[str, Any]:
         """
         Calculate performance metrics.
         
         Args:
             equity_curve: DataFrame with equity curve
-            daily_returns: DataFrame with daily returns
+            bar_returns: DataFrame with returns per bar (e.g., hourly)
             
         Returns:
             Dictionary with performance metrics
@@ -875,7 +982,10 @@ class Backtester:
         
         # Calculate returns
         total_return = (final_equity - start_equity) / start_equity
-        annual_return = total_return * (252 / len(daily_returns)) if len(daily_returns) > 0 else 0
+        # Annualization needs careful consideration for hourly data.
+        # Sticking to daily annualization factor (252) for simplicity.
+        trading_days_in_period = len(bar_returns.index.normalize().unique()) if not bar_returns.empty else 0
+        annual_return = total_return * (252 / trading_days_in_period) if trading_days_in_period > 0 else 0
         
         # Calculate drawdown
         rolling_max = equity_curve['equity'].cummax()
@@ -883,9 +993,12 @@ class Backtester:
         max_drawdown = abs(drawdown.min())
         
         # Calculate Sharpe Ratio (annualized)
-        if len(daily_returns) > 0:
-            sharpe_ratio = np.sqrt(252) * daily_returns['return'].mean() / daily_returns['return'].std() \
-                if daily_returns['return'].std() > 0 else 0
+        # Annualization factor for Sharpe should match return annualization. Using sqrt(252) for daily-based annualization.
+        if not bar_returns.empty:
+            # Calculate daily returns first for Sharpe calculation based on daily volatility
+            daily_returns_grouped = bar_returns['return'].resample('D').sum() # Approximate daily return from hourly bars
+            sharpe_ratio = np.sqrt(252) * daily_returns_grouped.mean() / daily_returns_grouped.std() \
+                if daily_returns_grouped.std() > 0 else 0
         else:
             sharpe_ratio = 0
         

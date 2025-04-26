@@ -166,31 +166,27 @@ class Strategy:
     
     def is_duplicate_signal(self, signal_type: SignalType, symbol: str, timestamp: pd.Timestamp) -> bool:
         """
-        Check if a signal is a duplicate.
-        
+        Check if a signal is a duplicate within the same candle interval (e.g., hour).
+
         Args:
             signal_type: Type of signal
             symbol: Trading symbol
             timestamp: Signal timestamp
-            
+
         Returns:
             True if signal is a duplicate, False otherwise
         """
-        if signal_type == SignalType.ENTRY:
-            if symbol in self._last_entry_signals:
-                last_ts = self._last_entry_signals[symbol]
-                # Consider as duplicate if within same candle
-                if timestamp.floor('5min') == last_ts.floor('5min'):
-                    return True
-            self._last_entry_signals[symbol] = timestamp
-        else:  # EXIT
-            if symbol in self._last_exit_signals:
-                last_ts = self._last_exit_signals[symbol]
-                # Consider as duplicate if within same candle
-                if timestamp.floor('5min') == last_ts.floor('5min'):
-                    return True
-            self._last_exit_signals[symbol] = timestamp
-        
+        last_signals_map = self._last_entry_signals if signal_type == SignalType.ENTRY else self._last_exit_signals
+
+        if symbol in last_signals_map:
+            last_ts = last_signals_map[symbol]
+            # Consider as duplicate if within the same hour bar
+            # Use floor('h') for hourly interval (replaced 'H')
+            if timestamp.floor('h') == last_ts.floor('h'):
+                return True
+
+        # Update the last signal timestamp for this type and symbol
+        last_signals_map[symbol] = timestamp
         return False
 
     def generate_signals(self, df: pd.DataFrame, symbol: str) -> List[Signal]:

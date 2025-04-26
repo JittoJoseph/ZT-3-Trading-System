@@ -52,10 +52,10 @@ def parse_arguments():
         help='Configuration file name within config directory'
     )
     
-    # Date range - Adjust defaults for daily data (e.g., 2 years)
+    # Date range - Defaults suitable for 1-hour data (e.g., 2 years)
     parser.add_argument(
         '--start-date', '-s',
-        default=(datetime.now() - pd.DateOffset(years=2)).strftime('%Y-%m-%d'),
+        default=(datetime.now() - pd.DateOffset(years=2)).strftime('%Y-%m-%d'), # Keep 2 years default for now
         help='Start date for backtest (YYYY-MM-DD), default: 2 years ago'
     )
     
@@ -185,7 +185,7 @@ def main():
                 for symbol in backtester.symbols:
                     csv_paths[symbol] = args.csv_path
         
-        logger.info(f"Using {args.data_source} as data source with 'day' interval")
+        logger.info(f"Using {args.data_source} as data source with '1hour' interval (via V3 API)") # Updated log message
         logger.info(f"Date range: {args.start_date} to {args.end_date}")
         
         # Setup notification for backtest start

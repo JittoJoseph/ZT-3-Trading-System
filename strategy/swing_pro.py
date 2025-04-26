@@ -1,72 +1,81 @@
 """
-SwingPro Strategy Module for ZT-3 Trading System.
+SwingPro Strategy Implementation for ZT-3 Trading System.
 
-This module implements a swing trading strategy based on MACD, RSI,
-EMAs, and ATR, inspired by the provided PineScript.
-It operates on daily candles.
+Based on the provided PineScript logic.
 """
 
 import logging
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Union, Optional, Tuple
-from datetime import datetime
-
-from strategy import SignalType, ExitReason, Signal, Strategy
-from strategy.indicators import Indicators # Assuming indicators are in this class
+from typing import Dict, List, Any, Optional
+from . import Strategy, Signal, SignalType, ExitReason
+from .indicators import Indicators
 
 logger = logging.getLogger(__name__)
 
 class SwingProStrategy(Strategy):
     """
-    SwingPro trading strategy for daily intervals.
+    SwingPro Strategy based on EMA, RSI, MACD, and ATR.
 
-    Based on PineScript: "SwingPro v7 – Adaptive Signal Sizer"
-
-    Entry: Long when MACD is positive, RSI < 70. (MTF filter disabled for now)
-    Exit: ATR-based SL/TP (TP1 partial, TP2 full), or EMA(20) crossunder.
-    Sizing: Dynamic based on signal strength (MACD hist + RSI).
+    Uses 1-hour timeframe data and an optional daily EMA filter.
     """
 
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize the SwingPro strategy.
+        Initialize the SwingProStrategy.
 
         Args:
-            config: System configuration dictionary
+            config: System configuration dictionary (used for general settings, not strategy parameters)
         """
         super().__init__(config)
         self.name = "SwingProStrategy"
 
-        # Strategy Parameters (from PineScript inputs)
-        self.risk_mult_atr_sl = 1.5
-        self.risk_mult_atr_tp1 = 3.0
-        self.risk_mult_atr_tp2 = 4.0
-        self.trail_ema_len = 20
-        self.ema_50_len = 50
-        self.ema_200_len = 200
-        self.rsi_len = 14
-        self.rsi_ob_level = 70.0
-        self.macd_fast = 12
-        self.macd_slow = 26
-        self.macd_signal = 9
-        self.atr_len = 14
-        self.use_mtf_trend = False # Disabled for now
-        self.daily_ema_len = 50 # Relevant if use_mtf_trend is True
+        # === Hardcoded Parameters (based on strategy.pine v7) ===
+        self.risk_mult_atr_sl: float = 1.5
+        self.risk_mult_atr_tp1: float = 3.0
+        self.risk_mult_atr_tp2: float = 4.0
+        self.trail_ema_len: int = 20
+        self.ema_50_len: int = 50
+        self.ema_200_len: int = 200
+        self.rsi_len: int = 14
+        self.rsi_ob_level: int = 70 # Overbought level for entry condition
+        self.macd_fast: int = 12
+        self.macd_slow: int = 26
+        self.macd_signal: int = 9
+        self.atr_len: int = 14
+        self.use_mtf_trend: bool = True
+        self.daily_ema_len: int = 50
+        # Position sizing parameters (from PineScript v7)
+        self.base_position_percent: float = 0.80 # Base allocation (80%)
+        self.scaling_position_percent: float = 0.20 # Scalable part (20%)
 
-        # Position tracking (stores entry price, quantity, TP/SL levels)
-        # Structure: {symbol: {'entry_price': float, 'quantity': int, 'initial_quantity': int,
-        #                      'stop_loss': float, 'take_profit1': float, 'take_profit2': float}}
+        # Internal state for tracking open positions and their details
+        self.open_positions: Dict[str, Dict[str, Any]] = {} # symbol -> {entry_price, quantity, initial_quantity, stop_loss, take_profit1, take_profit2}
+
+        logger.info(f"{self.name} initialized with hardcoded parameters.")
+        logger.debug(f"Parameters: ATR SL={self.risk_mult_atr_sl}, TP1={self.risk_mult_atr_tp1}, TP2={self.risk_mult_atr_tp2}, TrailEMA={self.trail_ema_len}, UseMTF={self.use_mtf_trend}, DailyEMA={self.daily_ema_len}")
+
+    def reset_position_tracking(self):
+        """Resets the tracking of open positions."""
         self.open_positions = {}
+        logger.debug(f"{self.name}: Position tracking reset.")
 
-        logger.info(f"Initialized {self.name} Strategy")
+    def update_open_position(self, symbol: str, details: Optional[Dict[str, Any]]):
+        """Updates or removes the tracking details for an open position."""
+        if details:
+            self.open_positions[symbol] = details
+            logger.debug(f"Updated open position tracking for {symbol}: {details}")
+        elif symbol in self.open_positions:
+            del self.open_positions[symbol]
+            logger.debug(f"Removed open position tracking for {symbol}.")
+
 
     def prepare_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Prepare data by calculating all necessary indicators.
+        Prepare data by calculating all necessary indicators for SwingPro.
 
         Args:
-            df: DataFrame with raw OHLCV data (expected daily)
+            df: DataFrame with raw OHLCV data (assumed 1-hour)
 
         Returns:
             DataFrame with all indicators added
@@ -74,223 +83,240 @@ class SwingProStrategy(Strategy):
         if df.empty:
             return df
 
-        # Calculate indicators using the Indicators class or direct pandas ops
-        df = Indicators.ema(df, period=self.trail_ema_len)
-        df = Indicators.ema(df, period=self.ema_50_len)
-        df = Indicators.ema(df, period=self.ema_200_len)
-        df = Indicators.rsi(df, period=self.rsi_len)
+        logger.debug(f"Preparing data for {self.name} - Initial rows: {len(df)}")
+
+        # Calculate indicators using hardcoded periods
+        df = Indicators.ema(df, period=self.trail_ema_len) # ema_20
+        df = Indicators.ema(df, period=self.ema_50_len)    # ema_50
+        df = Indicators.ema(df, period=self.ema_200_len)   # ema_200
+        df = Indicators.rsi(df, period=self.rsi_len)       # rsi_14
         df = Indicators.macd(df, fast_period=self.macd_fast, slow_period=self.macd_slow, signal_period=self.macd_signal)
-        df = Indicators.atr(df, period=self.atr_len)
+        df = Indicators.atr(df, period=self.atr_len)       # atr_14
 
-        # Add MTF Daily EMA if enabled (requires more complex data handling)
+        # Calculate Daily EMA if needed (requires resampling)
         if self.use_mtf_trend:
-            # This part needs implementation if MTF is required.
-            # It would involve requesting daily data if the primary timeframe isn't daily,
-            # or ensuring the input df is daily.
-            # For now, we assume df is daily and calculate EMA on it.
-            df = Indicators.ema(df, period=self.daily_ema_len, source_col='close')
-            df.rename(columns={f'ema_{self.daily_ema_len}': 'daily_ema'}, inplace=True)
-            df['in_uptrend_mtf'] = df['close'] > df['daily_ema']
-        else:
-            df['in_uptrend_mtf'] = True # Always true if filter is disabled
+            try:
+                # Resample to daily, calculate EMA, then reindex back to original hourly index
+                daily_close = df['close'].resample('D').last()
+                daily_ema = daily_close.ewm(span=self.daily_ema_len, adjust=False).mean()
+                # Forward fill the daily EMA onto the hourly index
+                df[f'daily_ema_{self.daily_ema_len}'] = daily_ema.reindex(df.index, method='ffill')
+                # Calculate the MTF trend condition
+                df['in_uptrend_mtf'] = df['close'] > df[f'daily_ema_{self.daily_ema_len}']
+            except Exception as e:
+                logger.error(f"Error calculating daily EMA trend: {e}. Disabling MTF filter for this run.")
+                df['in_uptrend_mtf'] = True # Default to true if calculation fails
 
-        # Calculate signal strength components
-        df['macd_positive'] = df['macd_line'] > df['macd_signal']
-        df['rsi_not_overbought'] = df['rsi'] < self.rsi_ob_level
+        # Drop rows with NaN values created by indicator calculations
+        # Calculate the minimum required rows based on the longest period used
+        min_rows = max(self.ema_200_len, self.macd_slow + self.macd_signal, self.atr_len) # Use macd_slow here
+        if self.use_mtf_trend:
+             # Daily EMA needs more data points initially due to resampling
+             min_rows = max(min_rows, self.daily_ema_len * 2) # Heuristic, needs enough days
 
-        # Calculate signal strength (0 to 1 range approx)
-        # Normalize MACD hist? PineScript uses raw value. Let's try normalizing.
-        # Normalize RSI strength (0 to 1, higher when further below 70)
-        macd_hist_abs_norm = df['macd_hist'].abs() / df['macd_hist'].abs().rolling(window=50, min_periods=10).max().fillna(1) # Normalize over rolling window
-        rsi_strength = (self.rsi_ob_level - df['rsi'].clip(upper=self.rsi_ob_level)) / self.rsi_ob_level
-        df['signal_strength'] = (macd_hist_abs_norm.fillna(0) + rsi_strength.fillna(0)) / 2 # Average normalized strengths
-        df['signal_strength'] = df['signal_strength'].clip(0, 1) # Ensure 0-1 range
+        initial_len = len(df)
+        df.dropna(inplace=True)
+        final_len = len(df)
+        logger.debug(f"Data preparation complete. Dropped {initial_len - final_len} rows due to NaNs. Final rows: {final_len}")
 
-        # Calculate position size multiplier (0.8 to 1.0)
-        df['position_percent_mult'] = 0.8 + (df['signal_strength'] * 0.2)
+        if final_len < 1:
+             logger.warning("Not enough data remains after indicator calculation and NaN removal.")
+
 
         return df
 
     def calculate_entry_quantity_percent(self, candle_data: pd.DataFrame) -> float:
         """
-        Calculate the percentage of equity to use for an entry based on signal strength.
+        Calculate the percentage of capital to allocate for an entry,
+        based on signal strength (MACD histogram and RSI).
 
         Args:
-            candle_data: DataFrame ending with the current candle.
+            candle_data: DataFrame with indicators up to the current candle.
 
         Returns:
-            Percentage of equity (e.g., 0.95 for 95%).
+            Percentage of capital (e.g., 0.8 to 1.0).
         """
-        if candle_data.empty or 'position_percent_mult' not in candle_data.columns:
-            return 0.95 # Default if calculation fails
+        if candle_data.empty or len(candle_data) < 2:
+            return self.base_position_percent # Default if not enough data
 
-        # Use the multiplier from the latest candle data
-        multiplier = candle_data['position_percent_mult'].iloc[-1]
+        last_candle = candle_data.iloc[-1]
 
-        # Ensure multiplier is within expected bounds
-        return max(0.8, min(1.0, multiplier if pd.notna(multiplier) else 0.95))
+        # Calculate signal strength components
+        macd_hist_strength = abs(last_candle.get('macd_hist', 0))
+        # Normalize RSI strength (0 to 1, higher when further from OB level)
+        rsi_strength = max(0.0, self.rsi_ob_level - last_candle.get('rsi', self.rsi_ob_level)) / self.rsi_ob_level
 
-    def calculate_stop_loss(self, entry_price: float, candle_data: pd.DataFrame) -> float:
-        """Calculate stop loss level."""
-        if candle_data.empty or 'atr' not in candle_data.columns:
-            return entry_price * (1 - 0.05) # Default 5% SL if ATR fails
-        atr_value = candle_data['atr'].iloc[-1]
-        return entry_price - (atr_value * self.risk_mult_atr_sl)
+        # Combine strengths (simple addition, capped at 1.0 - adjust logic if needed)
+        # This needs refinement to match PineScript's scaling intent.
+        # Let's try a simple scaling: assume max reasonable MACD hist is ~ some value, scale it 0-1.
+        # This is tricky without knowing typical hist ranges. Let's use a simpler approach for now:
+        # Average the normalized RSI strength and a capped/scaled MACD strength.
+        # Example: Cap MACD hist contribution to 1.0
+        scaled_macd_strength = min(1.0, macd_hist_strength / last_candle.get('atr', 1)) # Scale by ATR? Needs testing.
+        # Let's stick closer to PineScript: macd_strength + rsi_strength, then scale result.
+        raw_strength = scaled_macd_strength + rsi_strength # Combine (could exceed 1)
+        # Scale the combined strength to influence the scaling_position_percent
+        # Map raw_strength (e.g., 0 to 2 range?) to a 0-1 multiplier for the scaling part.
+        strength_multiplier = min(1.0, raw_strength / 1.5) # Normalize combined strength (heuristic)
 
-    def calculate_take_profit_levels(self, entry_price: float, candle_data: pd.DataFrame) -> Tuple[float, float]:
-        """Calculate take profit levels."""
-        if candle_data.empty or 'atr' not in candle_data.columns:
-            tp1 = entry_price * (1 + 0.10) # Default 10% TP1
-            tp2 = entry_price * (1 + 0.15) # Default 15% TP2
-            return tp1, tp2
-        atr_value = candle_data['atr'].iloc[-1]
-        tp1 = entry_price + (atr_value * self.risk_mult_atr_tp1)
-        tp2 = entry_price + (atr_value * self.risk_mult_atr_tp2)
-        return tp1, tp2
+        position_percent = self.base_position_percent + (self.scaling_position_percent * strength_multiplier)
+
+        # Ensure it's within reasonable bounds [0, 1]
+        position_percent = max(0.0, min(1.0, position_percent))
+
+        logger.debug(f"Calculated position percent: {position_percent:.3f} (RSI Strength: {rsi_strength:.3f}, MACD Strength: {scaled_macd_strength:.3f})")
+
+        return position_percent
+
 
     def process_candle(self, candle_data: pd.DataFrame, symbol: str) -> Optional[Signal]:
         """
-        Process new candle data and generate signals if conditions are met.
-        Operates on daily data.
+        Process the latest candle data for the SwingPro strategy.
 
         Args:
-            candle_data: DataFrame containing candle data with indicators, ending with the current candle.
-            symbol: Trading symbol
+            candle_data: DataFrame with OHLCV and calculated indicators.
+                         Assumes the last row is the current candle to process.
+            symbol: Trading symbol (e.g., 'NSE:PNB')
 
         Returns:
-            Signal if conditions are met, None otherwise
+            Signal if conditions are met, None otherwise.
         """
-        min_required_data = max(self.ema_200_len, self.macd_slow + self.macd_signal) + 5
-        if len(candle_data) < min_required_data:
-            # logger.debug(f"Not enough data for {symbol} ({len(candle_data)} < {min_required_data})")
-            return None # Not enough data
+        if candle_data.empty or len(candle_data) < 2:
+            # Need at least 2 rows for some checks (like previous candle state)
+            return None
 
-        # Ensure data is prepared (indicators calculated)
-        # Assuming prepare_data was called beforehand or is implicitly handled by the caller (backtester)
-        # For safety, call it, but this might be redundant if backtester already does it.
-        # data = self.prepare_data(candle_data) # Potentially redundant
-        data = candle_data # Assume data is prepared
+        # Get the latest and previous candle data
+        last = candle_data.iloc[-1]
+        # prev = candle_data.iloc[-2] # Not explicitly used in this version's logic, but might be useful
 
-        # Check for NaN values in critical indicators for the latest candle
-        current = data.iloc[-1]
-        required_cols = ['close', 'high', 'low', f'ema_{self.trail_ema_len}', 'macd_positive', 'rsi_not_overbought', 'in_uptrend_mtf', 'atr']
-        if current[required_cols].isnull().any():
-            # logger.debug(f"NaN values found in indicators for {symbol} at {current.name}")
-            return None # Wait for indicators to be calculated
+        timestamp = last.name # Timestamp is the index
+        current_price = last['close']
 
-        timestamp = current.name
+        # Check if a position is already open for this symbol
+        is_position_open = symbol in self.open_positions
+        open_pos_details = self.open_positions.get(symbol)
 
-        # --- Check Exit Conditions First ---
-        if symbol in self.open_positions:
-            position = self.open_positions[symbol]
-            exit_signal = None
-            exit_price = current['close'] # Default exit price
+        # --- Check Exit Conditions First (if position is open) ---
+        if is_position_open and open_pos_details:
+            entry_price = open_pos_details['entry_price']
+            stop_loss_level = open_pos_details['stop_loss']
+            take_profit1_level = open_pos_details['take_profit1']
+            take_profit2_level = open_pos_details['take_profit2']
+            initial_quantity = open_pos_details['initial_quantity']
+            current_quantity = open_pos_details['quantity']
 
-            # 1. Stop Loss
-            if current['low'] <= position['stop_loss']:
-                exit_price = position['stop_loss'] # Exit at SL level
-                exit_signal = Signal(SignalType.EXIT, symbol, exit_price, timestamp, exit_reason=ExitReason.STOP_LOSS)
-                logger.debug(f"{timestamp} - {symbol}: Stop Loss triggered at {exit_price:.2f}")
-
-            # 2. Take Profit 2 (Full Exit)
-            elif current['high'] >= position['take_profit2']:
-                exit_price = position['take_profit2'] # Exit at TP2 level
-                exit_signal = Signal(SignalType.EXIT, symbol, exit_price, timestamp, exit_reason=ExitReason.TAKE_PROFIT)
-                logger.debug(f"{timestamp} - {symbol}: Take Profit 2 triggered at {exit_price:.2f}")
-
-            # 3. Take Profit 1 (Partial Exit - 50%)
-            elif current['high'] >= position['take_profit1'] and position['quantity'] == position['initial_quantity']: # Only trigger TP1 once
-                exit_price = position['take_profit1'] # Exit at TP1 level
-                # Create a partial exit signal - backtester needs to handle this
-                exit_signal = Signal(SignalType.EXIT, symbol, exit_price, timestamp, exit_reason=ExitReason.PARTIAL_TAKE_PROFIT)
-                logger.debug(f"{timestamp} - {symbol}: Partial Take Profit 1 triggered at {exit_price:.2f}")
-                # Note: We don't remove the position here, backtester handles partial close
-
-            # 4. EMA Trail Exit
-            elif current['close'] < current[f'ema_{self.trail_ema_len}']:
-                exit_signal = Signal(SignalType.EXIT, symbol, exit_price, timestamp, exit_reason=ExitReason.EMA_CROSS)
-                logger.debug(f"{timestamp} - {symbol}: EMA Trail Exit triggered at {exit_price:.2f}")
-
-            # If a full exit signal was generated, remove the position
-            if exit_signal and exit_signal.exit_reason != ExitReason.PARTIAL_TAKE_PROFIT:
-                self.open_positions.pop(symbol, None)
-
-            if exit_signal:
-                 # Avoid duplicate exit signals for the same candle
-                if not self.is_duplicate_signal(SignalType.EXIT, symbol, timestamp):
-                    return exit_signal
-                else:
-                    logger.debug(f"Duplicate EXIT signal ignored for {symbol} at {timestamp}")
-                    return None
+            # 1. Stop Loss Hit
+            if current_price <= stop_loss_level:
+                 if not self.is_duplicate_signal(SignalType.EXIT, symbol, timestamp):
+                    logger.info(f"{timestamp} - EXIT Signal (SL): {symbol} @ {current_price:.2f} (SL Level: {stop_loss_level:.2f})")
+                    # No need to update self.open_positions here, backtester handles it
+                    return Signal(SignalType.EXIT, symbol, current_price, timestamp, exit_reason=ExitReason.STOP_LOSS)
+                 else:
+                    logger.debug(f"Duplicate EXIT signal (SL) ignored for {symbol} at {timestamp}")
 
 
-        # --- Check Entry Conditions ---
-        elif symbol not in self.open_positions: # Only enter if no position is open
-            # Entry Conditions from PineScript
-            entry_condition = current['macd_positive'] and \
-                              current['rsi_not_overbought'] and \
-                              current['in_uptrend_mtf'] # MTF filter applied here
+            # 2. Take Profit 2 Hit (Full Exit)
+            if take_profit2_level and current_price >= take_profit2_level:
+                 if not self.is_duplicate_signal(SignalType.EXIT, symbol, timestamp):
+                    logger.info(f"{timestamp} - EXIT Signal (TP2): {symbol} @ {current_price:.2f} (TP2 Level: {take_profit2_level:.2f})")
+                    # No need to update self.open_positions here, backtester handles it
+                    return Signal(SignalType.EXIT, symbol, current_price, timestamp, exit_reason=ExitReason.TAKE_PROFIT)
+                 else:
+                    logger.debug(f"Duplicate EXIT signal (TP2) ignored for {symbol} at {timestamp}")
+
+
+            # 3. Trailing EMA Cross Exit (Full Exit)
+            if current_price < last[f'ema_{self.trail_ema_len}']:
+                 if not self.is_duplicate_signal(SignalType.EXIT, symbol, timestamp):
+                    logger.info(f"{timestamp} - EXIT Signal (EMA Cross): {symbol} @ {current_price:.2f} (EMA: {last[f'ema_{self.trail_ema_len}']:.2f})")
+                    # No need to update self.open_positions here, backtester handles it
+                    return Signal(SignalType.EXIT, symbol, current_price, timestamp, exit_reason=ExitReason.EMA_CROSS)
+                 else:
+                    logger.debug(f"Duplicate EXIT signal (EMA Cross) ignored for {symbol} at {timestamp}")
+
+
+            # 4. Take Profit 1 Hit (Partial Exit - only if not already partially closed)
+            # Check if current quantity equals initial quantity (meaning no partial close yet)
+            if take_profit1_level and current_price >= take_profit1_level and current_quantity == initial_quantity:
+                 if not self.is_duplicate_signal(SignalType.EXIT, symbol, timestamp): # Use EXIT type for tracking partials too
+                    logger.info(f"{timestamp} - PARTIAL EXIT Signal (TP1): {symbol} @ {current_price:.2f} (TP1 Level: {take_profit1_level:.2f})")
+                    # Backtester needs to handle the partial close logic based on this reason
+                    # Signal price is the current price
+                    # No need to update self.open_positions here, backtester handles it
+                    return Signal(SignalType.EXIT, symbol, current_price, timestamp, exit_reason=ExitReason.PARTIAL_TAKE_PROFIT)
+                 else:
+                    logger.debug(f"Duplicate PARTIAL EXIT signal (TP1) ignored for {symbol} at {timestamp}")
+
+
+        # --- Check Entry Conditions (if no position is open) ---
+        elif not is_position_open:
+            # Conditions from PineScript: macd_positive and rsi_not_overbought and trend_filter
+            macd_positive = last['macd_line'] > last['macd_signal']
+            rsi_not_overbought = last['rsi'] < self.rsi_ob_level
+            trend_filter = last['in_uptrend_mtf'] if self.use_mtf_trend else True
+
+            entry_condition = macd_positive and rsi_not_overbought and trend_filter
 
             if entry_condition:
-                 # Avoid duplicate entry signals for the same candle
                 if not self.is_duplicate_signal(SignalType.ENTRY, symbol, timestamp):
-                    entry_price = current['close']
-                    # Calculate SL/TP levels based on current ATR
-                    stop_loss_level = self.calculate_stop_loss(entry_price, data)
-                    take_profit1_level, take_profit2_level = self.calculate_take_profit_levels(entry_price, data)
+                    entry_price = current_price # Use close price for signal
+                    atr_value = last['atr']
 
-                    entry_signal = Signal(
+                    # Calculate SL and TP levels based on entry price and current ATR
+                    stop_loss_level = entry_price - (atr_value * self.risk_mult_atr_sl)
+                    take_profit1_level = entry_price + (atr_value * self.risk_mult_atr_tp1)
+                    take_profit2_level = entry_price + (atr_value * self.risk_mult_atr_tp2)
+
+                    logger.info(f"{timestamp} - ENTRY Signal: {symbol} @ {entry_price:.2f} (ATR: {atr_value:.2f}, SL: {stop_loss_level:.2f}, TP1: {take_profit1_level:.2f}, TP2: {take_profit2_level:.2f})")
+
+                    # Store intended position details temporarily - Backtester will confirm and update
+                    # This helps calculate_entry_quantity_percent if needed by backtester before trade confirmation
+                    # Note: Backtester should overwrite/confirm this upon actual trade execution
+                    self.open_positions[symbol] = {
+                        'entry_price': entry_price, # Tentative
+                        'quantity': 0, # Tentative
+                        'initial_quantity': 0, # Tentative
+                        'stop_loss': stop_loss_level,
+                        'take_profit1': take_profit1_level,
+                        'take_profit2': take_profit2_level
+                    }
+
+
+                    return Signal(
                         signal_type=SignalType.ENTRY,
                         symbol=symbol,
                         price=entry_price,
                         timestamp=timestamp,
-                        stop_loss_level=stop_loss_level,
-                        # Store TP levels in the signal? Or just in open_positions? Let's store here for consistency.
-                        # Backtester will use these to populate the Trade object.
-                        # Using custom fields or a dict might be better if Signal class is fixed.
-                        # For now, let's assume backtester looks up TP levels when creating Trade.
+                        stop_loss_level=stop_loss_level
+                        # TP levels are stored internally for exit checks, not needed in entry signal itself
                     )
-
-                    # Store position details - Backtester will use this signal to create the Trade object
-                    # and then populate self.open_positions
-                    # We pre-calculate levels here for clarity, backtester confirms/uses them.
-                    self.open_positions[symbol] = {
-                         # 'entry_price': entry_price, # Set by backtester
-                         # 'quantity': 0, # Set by backtester
-                         # 'initial_quantity': 0, # Set by backtester
-                         'stop_loss': stop_loss_level,
-                         'take_profit1': take_profit1_level,
-                         'take_profit2': take_profit2_level
-                    }
-                    logger.debug(f"{timestamp} - {symbol}: Entry signal generated at {entry_price:.2f}")
-                    return entry_signal
                 else:
                     logger.debug(f"Duplicate ENTRY signal ignored for {symbol} at {timestamp}")
 
+        # No signal generated
+        return None
 
-        return None # No signal generated
+    # calculate_take_profit and calculate_stop_loss might not be needed if
+    # levels are determined at entry and stored, as done above.
+    # Keep stubs if the base class requires them.
 
-    def update_open_position(self, symbol: str, trade_info: Dict[str, Any]):
+    def calculate_take_profit(self, entry_price: float, candle_data: pd.DataFrame) -> float:
         """
-        Called by the backtester after a trade is opened or partially closed.
-        Updates the internal tracking.
-
-        Args:
-            symbol: The symbol traded.
-            trade_info: Dictionary containing current trade state
-                        (e.g., entry_price, quantity, initial_quantity, sl, tp1, tp2).
-                        If trade_info is None, it means the position was fully closed.
+        Calculate take profit level (Not directly used if TP levels are set at entry).
         """
-        if trade_info:
-            self.open_positions[symbol] = trade_info
-            logger.debug(f"Updated open position for {symbol}: Qty={trade_info.get('quantity')}")
-        else:
-            if symbol in self.open_positions:
-                del self.open_positions[symbol]
-                logger.debug(f"Removed closed position for {symbol}")
+        # This logic is now handled within process_candle at entry time.
+        # Return a placeholder or raise NotImplementedError if required by base class structure.
+        # For SwingPro, TP is ATR-based from entry. Let's return TP2 as an example.
+        if candle_data.empty: return entry_price * 1.1 # Placeholder
+        atr_value = candle_data['atr'].iloc[-1]
+        return entry_price + (atr_value * self.risk_mult_atr_tp2)
 
-    def reset_position_tracking(self):
-        """Reset internal position tracking."""
-        self.open_positions = {}
-        logger.info("Reset internal position tracking for SwingProStrategy.")
+    def calculate_stop_loss(self, entry_price: float, candle_data: pd.DataFrame) -> float:
+        """
+        Calculate stop loss level (Not directly used if SL level is set at entry).
+        """
+        # This logic is now handled within process_candle at entry time.
+        if candle_data.empty: return entry_price * 0.9 # Placeholder
+        atr_value = candle_data['atr'].iloc[-1]
+        return entry_price - (atr_value * self.risk_mult_atr_sl)
 

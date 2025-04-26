@@ -14,24 +14,25 @@ symbols:
     min_qty: 1
     tick_size: 0.05
     lot_size: 1
-  - ticker: "CANBK"
-    exchange: "NSE"
-    name: "Canara Bank"
-    min_qty: 1
-    tick_size: 0.05
-    lot_size: 1
+  # Add more symbols as needed
+  # - ticker: "SBIN"
+  #   exchange: "NSE"
+  #   name: "State Bank of India"
+  #   min_qty: 1
+  #   tick_size: 0.05
+  #   lot_size: 1
 
-# Strategy identifier (no parameters here)
+# Strategy identifier (Parameters are now hardcoded in the strategy class)
 strategy:
-  name: "SwingProStrategy"
+  name: "SwingProStrategy" # Used by backtester/runner to load the correct class
 
-# Risk Management Settings
+# Risk Management Settings (These are system-level, not strategy-specific)
 risk:
   max_daily_loss: 5.0 # Percentage of capital
-  max_daily_trades: 5
-  capital_percent: 95.0 # Percentage of capital to allocate per trade
+  max_daily_trades: 10 # Increased limit
+  # capital_percent: 95.0 # Removed - Strategy now calculates its own allocation %
   circuit_breaker_enabled: true
-  end_of_day_closure: true
+  end_of_day_closure: true # Close positions before market close
   end_of_day_time: "15:15" # HH:MM in 24-hour format
 
 # Paper Trading Settings
@@ -44,44 +45,45 @@ paper_trading:
 
 # Order Execution Settings
 execution:
-  order_type: "LIMIT"
-  slippage_tolerance: 0.1
+  order_type: "LIMIT" # Or MARKET
+  slippage_tolerance: 0.1 # For LIMIT orders, how far from current price
   retry_attempts: 3
-  retry_delay: 2
+  retry_delay: 2 # seconds
 
 # Notifications
 notifications:
   discord:
-    enabled: true
+    enabled: true # Master switch for Discord notifications
     webhooks:
       trade_alerts: "${DISCORD_WEBHOOK_TRADE_ALERTS}" # For buy/sell trade execution notifications
       performance: "${DISCORD_WEBHOOK_PERFORMANCE}" # For daily performance summaries
-      signals: "${DISCORD_WEBHOOK_SIGNALS}" # For strategy signal notifications
-      system_status: "${DISCORD_WEBHOOK_SYSTEM}" # For system health monitoring
+      signals: "${DISCORD_WEBHOOK_SIGNALS}" # For strategy signal notifications (can be noisy)
+      system_status: "${DISCORD_WEBHOOK_SYSTEM}" # For system health monitoring (startup, errors)
       backtest_results: "${DISCORD_WEBHOOK_BACKTEST}" # For detailed backtest results
-  notification_levels:
+  notification_levels: # Fine-grained control over which notifications are sent
     trade_alerts: true
     performance: true
-    signals: true
+    signals: false # Often too noisy, enable if needed
     system_status: true
+    backtest_results: true # Send backtest summary
 
 # Logging
 logging:
-  level: "INFO"
+  level: "INFO" # DEBUG, INFO, WARNING, ERROR, CRITICAL
   file: "logs/zt3.log"
   max_size_mb: 10
   backup_count: 5
-  trade_log: "logs/trades.log"
+  trade_log: "logs/trades.log" # Separate log for executed trades
 
 # Data Storage
 data:
-  save_candles: true
-  save_signals: true
-  save_trades: true
-  storage_path: "data/storage"
-  cache_historical_data: true
+  save_candles: true # Save downloaded candle data
+  save_signals: true # Save generated signals
+  save_trades: true # Save executed trades (paper or live)
+  storage_path: "data/storage" # Base directory for saved data
+  cache_historical_data: true # Cache API data locally (implement caching logic if needed)
 
-# Backtesting configuration
+# Backtesting configuration (System-level settings for backtests)
 backtest:
   starting_capital: 3000.0
   commission_percent: 0.03
