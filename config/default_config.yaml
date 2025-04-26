@@ -15,12 +15,6 @@ symbols:
     tick_size: 0.05
     lot_size: 1
   # Add more symbols as needed
-  # - ticker: "SBIN"
-  #   exchange: "NSE"
-  #   name: "State Bank of India"
-  #   min_qty: 1
-  #   tick_size: 0.05
-  #   lot_size: 1
 
 # Strategy identifier (Parameters are now hardcoded in the strategy class)
 strategy:

@@ -274,6 +274,15 @@ class NotificationManager:
             end_date = metrics.get('end_date', 'N/A')
             duration = metrics.get('duration_days', 'N/A')
 
+            # Determine embed color based on total return (Green > 2%, Red < 0%, Grey otherwise)
+            total_return_percent = metrics.get('total_return_percent', 0.0)
+            if total_return_percent > 2.0:
+                embed_color = 0x00FF00  # Green
+            elif total_return_percent < 0.0:  # Negative returns
+                embed_color = 0xFF0000  # Red
+            else:  # Between 0.0% and 2.0% inclusive
+                embed_color = 0x808080  # Grey
+
             # --- Build fields list with grouped "Name: Value" format ---
             fields_list = []
 
@@ -325,7 +334,7 @@ class NotificationManager:
             embed = {
                 "title": f"Backtest Results: {strategy_name}",
                 "description": f"**Symbols:** `{symbols}`\n**Period:** {start_date} to {end_date} ({duration} days)",
-                "color": 0x4CAF50,  # Green color
+                "color": embed_color,  # Set color based on performance
                 "timestamp": datetime.utcnow().isoformat(),
                 "fields": fields_list, # Use the generated list
                 "footer": {
